@@ -115,9 +115,10 @@ show a status header with a `>` cursor menu beneath it:
 - **ONEWAY** — one leg per `START`, then **holds at the far end** instead of returning.
   Docked at home, it loads, flies to the station, unloads, and waits there. The next
   `START` flies it straight back home and waits again. It decides which way to go from
-  **which connector it's docked at**, so it always knows whether it's sitting at home
-  or at the station — you never have to tell it. Good for "take this load over and stay
-  put until I send you back."
+  **which end it's physically parked at** (by proximity to the two recorded docked poses),
+  so it works even on a ship that mates both ends with the **same connector**, and always
+  knows whether it's sitting at home or at the station — you never have to tell it. Good
+  for "take this load over and stay put until I send you back."
 
 ## Base board
 

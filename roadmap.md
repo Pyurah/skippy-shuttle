@@ -4,7 +4,7 @@ Master tracking document for the SkippyShuttle Programmable Block script.
 
 ## Current status
 
-- **Version:** 0.8.0
+- **Version:** 0.8.1
 - **Phase:** 1 (Core shuttle) + LCD UI + orientation-matched docking — delivered, pending
   in-world validation
 - **Environment:** Space Engineers in-game Programmable Block (single-file C#, no external
@@ -96,6 +96,9 @@ docked connector (live), so it always knows which end it's sitting at across res
       at home → load + fly to dest; mid-route → continue outbound.
 - [x] Holds (stops, `operating=false`) after delivering at the station **and** after
       arriving home, instead of auto-cycling.
+- [x] **Direction is decided by physical proximity to the recorded docked poses, not the
+      connector name (v0.8.1)** — a shuttle that docks both ends with the *same* connector
+      no longer mis-reads which end it's parked at (was sending OneWay the wrong way).
 - [ ] Field-confirm: dispatch home→station holds at the station; a second `START` returns
       home and holds; mode survives a recompile mid-hold.
 

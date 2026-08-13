@@ -87,7 +87,7 @@
  * Version tracked in CHANGELOG.md. Semver.
  *//////////////////////////////////////////////////////////////////////////////
 
-const string VERSION = "0.8.0";
+const string VERSION = "0.8.1";
 
 // ---- Roles / states --------------------------------------------------------
 enum Role { Shuttle, Base }
@@ -351,18 +351,23 @@ void HandleCommand(string arg)
             operating = true;
             // Kick off from wherever we sensibly can. ONEWAY runs a single leg to the
             // OPPOSITE end and holds there, so its direction is decided purely by which
-            // connector we're docked at: at dest -> depart straight for home (no re-unload);
-            // at home -> load and head to dest. The other modes cycle a full round trip.
+            // END we're physically docked at (by pose proximity, not connector name -
+            // this ship docks both ends with the same connector): at home -> load and
+            // head to dest; at dest -> depart straight for home (no re-unload). The
+            // other modes cycle a full round trip.
             if (state == State.Idle || state == State.Faulted)
             {
+                bool docked = DockedNow();
+                bool atHome = AtHomeEnd();
                 if (runMode == RunMode.OneWay)
-                    state = IsDockedAt(destConn) ? State.UndockDest
-                          : IsDockedAt(homeConn) ? State.Loading
-                          : State.CruiseToDest;
+                    state = docked && atHome ? State.Loading
+                          : docked          ? State.UndockDest
+                          : atHome          ? State.CruiseToDest
+                          :                   State.CruiseToHome;
                 else
-                    state = IsDockedAt(homeConn) ? State.Loading
-                          : IsDockedAt(destConn) ? State.Unloading
-                          : State.CruiseToHome;
+                    state = docked && atHome ? State.Loading
+                          : docked          ? State.Unloading
+                          :                   State.CruiseToHome;
             }
             statusMsg = "Started (" + runMode + ")";
             break;
@@ -378,10 +383,20 @@ void HandleCommand(string arg)
             break;
 
         case "HOME":
-            operating = true;
+            if (!haveRoute) { statusMsg = "No route - RECORD HOME/DEST first"; break; }
             AbortAutopilot();
-            state = IsDockedAt(destConn) ? State.UndockDest : State.CruiseToHome;
-            statusMsg = "Returning home";
+            if (DockedNow() && AtHomeEnd())
+            {
+                operating = false;
+                state = State.Idle;
+                statusMsg = "Already home";
+            }
+            else
+            {
+                operating = true;
+                state = DockedNow() ? State.UndockDest : State.CruiseToHome;
+                statusMsg = "Returning home";
+            }
             break;
 
         case "MODE":
@@ -502,8 +517,7 @@ void TickIdle()
     AbortAutopilot();
     ReleaseControl();
     if (!operating) return;
-    if (IsDockedAt(homeConn)) state = State.Loading;
-    else if (IsDockedAt(destConn)) state = State.Unloading;
+    if (DockedNow()) state = AtHomeEnd() ? State.Loading : State.Unloading;
     else state = State.CruiseToHome;
 }
 
@@ -1095,10 +1109,20 @@ IMyShipConnector GetConnector(string name)
     return null;
 }
 
-bool IsDockedAt(string connName)
+// Am I physically connected to ANY connector right now? Name-independent, so it
+// works even when the ship docks both ends with the same physical connector.
+bool DockedNow() { return ConnectedConnector() != null; }
+
+// Which recorded end is the ship physically at? Decided by proximity to the two
+// recorded docked poses (distinct world coordinates ~78 km apart), NOT by the
+// connector name - a shuttle that docks both ends with the SAME connector has
+// homeConn == destConn, so a name match can't tell the ends apart. Assumes the
+// two docked poses are separated by more than a ship length (true for any real
+// home/station pair). Only meaningful when haveRoute.
+bool AtHomeEnd()
 {
-    var c = GetConnector(connName);
-    return c != null && c.Status == MyShipConnectorStatus.Connected;
+    Vector3D p = rc.GetPosition();
+    return Vector3D.DistanceSquared(p, homePose.Pos) <= Vector3D.DistanceSquared(p, destPose.Pos);
 }
 
 void SetSorters(List<IMyConveyorSorter> list, bool on)

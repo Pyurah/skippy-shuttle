@@ -4,6 +4,25 @@ All notable changes to SkippyShuttle are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.1] - 2026-08-13
+
+### Fixed
+- **OneWay ran the wrong leg when the ship docks both ends with the same connector.**
+  `START` in OneWay while docked at home (and `HOME` while docked at home) sent the ship
+  haywire — it undocked, flew sideways in a straight beeline to the far end holding the
+  wrong (docked-at-destination) attitude, failed to seat, and eventually gave up and flew
+  back. Continuous and OneTrip were unaffected. Root cause: the direction was chosen by
+  connector **name** (`homeConn`/`destConn`), but a shuttle that mates both ends with the
+  **same physical connector** has identical names at both ends, so the name test couldn't
+  tell home from destination — and the OneWay branch happened to test the destination name
+  first, so "docked at home" read as "docked at destination." The ship's end is now decided
+  by **physical proximity to the two recorded docked poses** (distinct world coordinates),
+  which is name-independent and correct whether the ship uses one shared connector or a
+  separate connector per end. Also fixes the earlier "Go Home from home beelines" report,
+  which was the same collision. Purely dispatch logic — no route/config format change.
+  Assumes the two docked poses are separated by more than a ship length (true for any real
+  home/station pair).
+
 ## [0.8.0] - 2026-08-13
 
 ### Added
