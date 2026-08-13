@@ -30,7 +30,10 @@
  *   START / GO    Begin operating (loads, flies, unloads per the run mode).
  *   STOP          Abort autopilot and return to Idle (stays docked/where it is).
  *   HOME          Fly back to the home connector and dock.
- *   MODE CONTINUOUS | ONETRIP | WAITFULL | ONEWAY   Change the run mode live.
+ *   DEPART        Release the shuttle from the dock NOW (manual trigger / override).
+ *                 On a base PB it broadcasts the request: DEPART (all shuttles) or
+ *                 DEPART <shipName> (one), so a station can send the ship on its way.
+ *   MODE CONTINUOUS | ONETRIP | ONEWAY   Change the run mode live.
  *   RESUME        Continue the saved state after a recompile.
  *   CLEARROUTE    Erase the recorded route.
  *   UP / DOWN     Move the LCD menu cursor (bind to cockpit toolbar buttons).
@@ -42,7 +45,9 @@
  *   role         = shuttle            ; shuttle | base
  *   shipName     = Skippy             ; label shown on base screens
  *   channel      = SkippyShuttleNet   ; IGC broadcast channel (must match base)
- *   runMode      = CONTINUOUS         ; CONTINUOUS | ONETRIP | WAITFULL | ONEWAY
+ *   runMode      = CONTINUOUS         ; CONTINUOUS | ONETRIP | ONEWAY (trip cycle)
+ *   homeTrigger  = Auto               ; Auto | Cargo | Timer | Manual - releases from HOME
+ *   destTrigger  = Auto               ; Auto | Cargo | Timer | Manual - releases from DEST
  *   remoteName   =                    ; blank = auto-find a Remote Control
  *   loadTag      = [SHUTTLE:LOAD]      ; sorters with this tag in their name load cargo
  *   unloadTag    = [SHUTTLE:UNLOAD]    ; sorters with this tag in their name unload cargo
@@ -51,7 +56,11 @@
  *   dockSpeed    = 5                  ; [m/s] final-approach cap (precision mode)
  *   maxMassKg    = 0                  ; 0 = no mass gate; else stop loading here
  *   departFill   = 95                 ; [%] cargo fill that triggers departure
- *   unloadDrainSec = 30              ; [s] max time to spend unloading
+ *   unloadDrainSec = 30              ; [s] max time to spend unloading (Auto dest trigger)
+ *   dwellSec     = 30                 ; [s] Timer-trigger dwell at a dock before departing
+ *   minHydrogenPct = 10               ; [%] refuse to depart below this H2 level (0/no tanks = off)
+ *   minBatteryPct  = 10               ; [%] refuse to depart below this battery charge
+ *   fuelMarginPct  = 25               ; [%] headroom on the measured per-leg fuel/charge cost
  *   segMeters    = 250                ; breadcrumb spacing on straightaways
  *   turnDegrees  = 12                 ; extra breadcrumb when heading turns this much
  *   approachDist = 15                 ; [m] on-axis stand-off where docking takes over
@@ -87,14 +96,28 @@
  * Version tracked in CHANGELOG.md. Semver.
  *//////////////////////////////////////////////////////////////////////////////
 
-const string VERSION = "0.8.1";
+const string VERSION = "0.9.0";
 
 // ---- Roles / states --------------------------------------------------------
 enum Role { Shuttle, Base }
-// Continuous/OneTrip/WaitFull do a full round trip (home -> dest -> home). OneWay
-// runs a single leg to the OPPOSITE end and holds there; the next START sends it
-// back. Which way OneWay goes is decided by which connector it's docked at.
-enum RunMode { Continuous, OneTrip, WaitFull, OneWay }
+// RunMode is the TRIP CYCLE only. Continuous/OneTrip do a full round trip (home ->
+// dest -> home); OneWay runs a single leg to the OPPOSITE end and holds there, the
+// next START sending it back. Which way OneWay goes is decided by which END it's
+// physically parked at (pose proximity). The old WaitFull mode was folded into
+// Continuous + homeTrigger = Cargo (see DepartTrigger); a config that still says
+// WAITFULL loads as exactly that.
+enum RunMode { Continuous, OneTrip, OneWay }
+
+// DepartTrigger is a SEPARATE, PER-CONNECTOR setting (PAM-style): what releases the
+// shuttle from a dock to the next leg. Each end has its own.
+//   Auto   - leave as soon as the cargo op finishes (loaded at home / emptied at the
+//            dest, with the drain safety timeout) - the original behaviour.
+//   Cargo  - wait for the hold to be full at home / empty at the destination.
+//   Timer  - run the sorters for dwellSec, then leave regardless of fill.
+//   Manual - hold until a DEPART command arrives (ship button or station over IGC).
+// Departure is additionally gated on fuel/charge (see DepartFuelOk): the shuttle
+// won't leave a dock without enough hydrogen and battery to reach the next one.
+enum DepartTrigger { Auto, Cargo, Timer, Manual }
 
 // A full docked pose: where the Remote Control sat, which way the ship faced,
 // and the bound connector's mating axis. Capturing all four lets the shuttle
@@ -125,6 +148,8 @@ enum State
 // ---- Configuration (loaded from Custom Data) -------------------------------
 Role role = Role.Shuttle;
 RunMode runMode = RunMode.Continuous;
+DepartTrigger homeTrigger = DepartTrigger.Auto;   // what releases the shuttle from HOME
+DepartTrigger destTrigger = DepartTrigger.Auto;   // what releases it from the DESTINATION
 string shipName = "Skippy";
 string channel = "SkippyShuttleNet";
 string remoteName = "";
@@ -136,6 +161,10 @@ float dockSpeed = 5f;
 double maxMassKg = 0;
 double departFill = 95;
 double unloadDrainSec = 30;
+double dwellSec = 30;             // [s] Timer-trigger dwell at a dock before departing
+double minHydrogenPct = 10;       // [%] refuse to depart below this hydrogen level (ignored if no H2 tanks)
+double minBatteryPct = 10;        // [%] refuse to depart below this battery charge (ignored if no batteries)
+double fuelMarginPct = 25;        // [%] safety headroom added to the measured per-leg fuel/charge estimate
 double segMeters = 250;
 double turnDegrees = 12;
 double approachDist = 15;         // [m] on-axis stand-off where cruise hands to the docking controller
@@ -159,6 +188,16 @@ State state = State.Idle;
 bool operating = false;          // set by START, cleared by STOP / OneTrip end
 string statusMsg = "Idle";
 double phaseTimer = 0;           // seconds spent in the current timed phase
+bool departRequested = false;    // manual "Depart Now" latch (ship button / station IGC); consumed on departure
+
+// ---- Fuel / charge gate ----------------------------------------------------
+// Adaptive per-leg estimate: how much hydrogen and charge (in % points) the last
+// completed leg burned, measured each direction and persisted. A departure needs
+// current level >= estimate * (1 + fuelMarginPct/100), floored by minHydrogen/Battery.
+double estHydroOut = 0, estBattOut = 0;    // home -> dest consumption [% points]
+double estHydroHome = 0, estBattHome = 0;  // dest -> home consumption [% points]
+double legStartH2 = -1, legStartBatt = -1; // level captured at departure; -1 = not measuring
+bool legOutbound = true;                   // direction of the leg currently being measured
 
 // ---- Cruise controller state -----------------------------------------------
 // The custom cruise controller flies a flight-ordered list of waypoints, each
@@ -172,7 +211,7 @@ double cruiseAccel = 1.0;                       // [m/s^2] decel/lateral accel c
 double cruiseProgTimer = 0;                     // seconds since the cursor last advanced (stuck watchdog)
 
 // ---- LCD menu (ship role) --------------------------------------------------
-const int PAGE_MAIN = 0, PAGE_RECORD = 1, PAGE_SETTINGS = 2;
+const int PAGE_MAIN = 0, PAGE_RECORD = 1, PAGE_SETTINGS = 2, PAGE_DEPART = 3;
 int menuPage = PAGE_MAIN;
 int menuIndex = 0;               // cursor position within the current page
 bool editing = false;            // true while adjusting a value item
@@ -192,6 +231,8 @@ List<IMyTextSurface> screens = new List<IMyTextSurface>();
 IMyTextSurface pbSurface;                            // the PB's own screen (written, but not used to size)
 List<IMyGyro> gyros = new List<IMyGyro>();          // final-approach attitude control
 List<IMyThrust> thrusters = new List<IMyThrust>();  // final-approach translation control
+List<IMyGasTank> h2Tanks = new List<IMyGasTank>();  // hydrogen tanks (fuel-gate reading)
+List<IMyBatteryBlock> batteries = new List<IMyBatteryBlock>();  // batteries (charge-gate reading)
 IMyBroadcastListener listener;
 
 // ---- Base-role state -------------------------------------------------------
@@ -234,9 +275,10 @@ Program()
     Discover();
     LoadRoute();
     LoadState();
-    if (role == Role.Base)
-        listener = IGC.RegisterBroadcastListener(channel);
-    else
+    // Both roles listen on the channel: the base for status reports, the ship for
+    // remote DEPART commands sent by a station PB.
+    listener = IGC.RegisterBroadcastListener(channel);
+    if (role == Role.Shuttle)
         ReleaseControl();   // clear any thruster/gyro overrides left by a previous compile
 }
 
@@ -248,6 +290,10 @@ void Save()
     ini.Set("state", "state", state.ToString());
     ini.Set("state", "operating", operating);
     ini.Set("state", "phaseTimer", phaseTimer);
+    ini.Set("state", "estHydroOut", estHydroOut);
+    ini.Set("state", "estBattOut", estBattOut);
+    ini.Set("state", "estHydroHome", estHydroHome);
+    ini.Set("state", "estBattHome", estBattHome);
     Me.CustomData = ini.ToString();
 }
 
@@ -270,6 +316,8 @@ void Main(string argument, UpdateType source)
 
         // Ship role - re-discover cheaply if the remote vanished (regrind etc.)
         if (rc == null) { Discover(); if (rc == null) { statusMsg = "No Remote Control found"; RenderShip(); return; } }
+
+        DrainIgc();   // accept remote DEPART commands from a station PB
 
         switch (state)
         {
@@ -368,12 +416,15 @@ void HandleCommand(string arg)
                     state = docked && atHome ? State.Loading
                           : docked          ? State.Unloading
                           :                   State.CruiseToHome;
+                phaseTimer = 0;          // begin a fresh load/unload dwell
+                departRequested = false; // drop any stale manual-depart latch
             }
             statusMsg = "Started (" + runMode + ")";
             break;
 
         case "STOP":
             operating = false;
+            departRequested = false;
             AbortAutopilot();
             ReleaseControl();
             SetSorters(loadSorters, false);
@@ -404,6 +455,19 @@ void HandleCommand(string arg)
             else statusMsg = "Mode: " + runMode;
             break;
 
+        case "DEPART":
+            // Ship: release the current dock now (manual trigger / override). Base:
+            // broadcast the request to the shuttle(s) - "DEPART" for all, or
+            // "DEPART <shipName>" to target one.
+            if (role == Role.Base)
+            {
+                string who = parts.Length > 1 ? parts[1] : "*";
+                IGC.SendBroadcastMessage(channel, "CMD|DEPART|" + who);
+                statusMsg = "Sent DEPART to " + (who == "*" ? "all shuttles" : who);
+            }
+            else RequestDepart();
+            break;
+
         case "RESUME":
             LoadState();
             statusMsg = "Resumed: " + state;
@@ -432,9 +496,15 @@ void SetMode(string m)
     {
         case "CONTINUOUS": runMode = RunMode.Continuous; break;
         case "ONETRIP":    runMode = RunMode.OneTrip;    break;
-        case "WAITFULL":   runMode = RunMode.WaitFull;   break;
         case "ONEWAY":     runMode = RunMode.OneWay;     break;
-        default: statusMsg = "Mode must be CONTINUOUS|ONETRIP|WAITFULL|ONEWAY"; return;
+        case "WAITFULL":   // legacy: fold into Continuous + a Cargo home trigger
+            runMode = RunMode.Continuous;
+            homeTrigger = DepartTrigger.Cargo;
+            SaveCfg("runMode", "CONTINUOUS");
+            SaveCfg("homeTrigger", "Cargo");
+            statusMsg = "WaitFull -> Continuous + Home trigger = Cargo";
+            return;
+        default: statusMsg = "Mode must be CONTINUOUS|ONETRIP|ONEWAY"; return;
     }
     var ini = new MyIni(); ini.TryParse(Me.CustomData);
     ini.Set("shuttle", "runMode", m);
@@ -517,6 +587,7 @@ void TickIdle()
     AbortAutopilot();
     ReleaseControl();
     if (!operating) return;
+    phaseTimer = 0;   // fresh load/unload dwell when we pick a dock phase back up
     if (DockedNow()) state = AtHomeEnd() ? State.Loading : State.Unloading;
     else state = State.CruiseToHome;
 }
@@ -524,46 +595,97 @@ void TickIdle()
 void TickLoading()
 {
     SetSorters(unloadSorters, false);
+    phaseTimer += dt;
     double mass = ShipMassKg();
     double fill = CargoFillPct();
 
     bool massGate = maxMassKg > 0 && mass >= maxMassKg * 0.98;
-    bool full = fill >= departFill;
+    bool cargoReady = fill >= departFill || massGate;
 
-    if (massGate || full)
+    // Keep loading until the hold is full (or the mass gate trips); then stop the
+    // sorters even while we're still waiting on a Manual/Timer trigger, so a shuttle
+    // that dwells or waits for a button never keeps cramming past full/overweight.
+    SetSorters(loadSorters, !cargoReady);
+
+    if (DepartureAllowed(true, cargoReady))
     {
+        string why;
+        if (!DepartFuelOk(true, out why)) { SetSorters(loadSorters, false); statusMsg = why; return; }
         SetSorters(loadSorters, false);
+        departRequested = false;
+        BeginLegMeasure(true);
         statusMsg = "Loaded (" + fill.ToString("0") + "%, " + (mass / 1000.0).ToString("0.0") + "t) - departing";
         state = State.UndockHome;
         phaseTimer = 0;
         return;
     }
 
-    SetSorters(loadSorters, true);
-    statusMsg = "Loading " + fill.ToString("0") + "% (mass " + (mass / 1000.0).ToString("0.0") + "t)";
+    statusMsg = DepartStatus(true, fill);
 }
 
 void TickUnloading()
 {
     SetSorters(loadSorters, false);
-    SetSorters(unloadSorters, true);
     phaseTimer += dt;
     double fill = CargoFillPct();
-    statusMsg = "Unloading " + fill.ToString("0") + "%";
 
-    if (fill <= 1.0 || phaseTimer >= unloadDrainSec)
+    // Auto keeps its original drain-timeout safety net; the explicit Cargo trigger
+    // waits for a truly empty hold. Both stop the sorters once empty.
+    bool cargoReady = fill <= 1.0;
+    SetSorters(unloadSorters, !cargoReady);
+
+    if (DepartureAllowed(false, cargoReady))
     {
         SetSorters(unloadSorters, false);
-        phaseTimer = 0;
-        if (runMode == RunMode.OneWay)   // delivered - hold at the destination, don't auto-return
+
+        if (runMode == RunMode.OneWay)   // delivered - hold at the destination, don't return
         {
+            departRequested = false;
+            phaseTimer = 0;
             operating = false;
             state = State.Idle;
-            statusMsg = "Delivered - holding at " + destConn;
+            statusMsg = "Delivered - holding at destination";
+            return;
         }
-        else
-            state = State.UndockDest;   // return leg; OneTrip stops after docking home
+
+        // Round trip: don't leave for home without the fuel to get there.
+        string why;
+        if (!DepartFuelOk(false, out why)) { statusMsg = why; return; }
+        departRequested = false;
+        BeginLegMeasure(false);
+        phaseTimer = 0;
+        state = State.UndockDest;   // return leg; OneTrip stops after docking home
+        return;
     }
+
+    statusMsg = DepartStatus(false, fill);
+}
+
+// Should the shuttle leave this dock now? A manual DEPART overrides any trigger;
+// otherwise the end's configured trigger decides. `atHome` selects the trigger and
+// `cargoReady` is that end's cargo condition (full at home / empty at the dest).
+bool DepartureAllowed(bool atHome, bool cargoReady)
+{
+    if (departRequested) return true;   // manual "Depart Now" (ship button or station)
+    DepartTrigger trig = atHome ? homeTrigger : destTrigger;
+    switch (trig)
+    {
+        case DepartTrigger.Manual: return false;                    // wait for DEPART
+        case DepartTrigger.Timer:  return phaseTimer >= dwellSec;    // dwell, then go
+        case DepartTrigger.Cargo:  return cargoReady;               // full / empty
+        default:                                                    // Auto: cargo-ready, with the drain safety net at the dest
+            return cargoReady || (!atHome && phaseTimer >= unloadDrainSec);
+    }
+}
+
+// The holding status line while waiting on a trigger.
+string DepartStatus(bool atHome, double fill)
+{
+    string act = (atHome ? "Loading " : "Unloading ") + fill.ToString("0") + "%";
+    DepartTrigger trig = atHome ? homeTrigger : destTrigger;
+    if (trig == DepartTrigger.Manual) return act + " - waiting DEPART";
+    if (trig == DepartTrigger.Timer)  return act + " - dwell " + phaseTimer.ToString("0") + "/" + dwellSec.ToString("0") + "s";
+    return act;
 }
 
 // heading == true  => currently at HOME, undocking to go to DEST
@@ -1028,6 +1150,7 @@ void SetDampeners(bool on)
 
 void OnDocked(bool atDest)
 {
+    FinishLegMeasure();   // learn what the leg just flown actually cost in fuel/charge
     if (atDest)
     {
         state = State.Unloading;
@@ -1035,10 +1158,10 @@ void OnDocked(bool atDest)
     }
     else
     {
-        // Home again. OneTrip and OneWay stop and hold here; the cycling modes
-        // (Continuous/WaitFull) load and set out again.
+        // Home again. OneTrip and OneWay stop and hold here; Continuous loads and
+        // sets out again (subject to the home departure trigger).
         if (runMode == RunMode.OneTrip) { operating = false; state = State.Idle; statusMsg = "Trip complete"; }
-        else if (runMode == RunMode.OneWay) { operating = false; state = State.Idle; statusMsg = "Holding at " + homeConn; }
+        else if (runMode == RunMode.OneWay) { operating = false; state = State.Idle; statusMsg = "Holding at home"; }
         else { state = State.Loading; phaseTimer = 0; }
     }
 }
@@ -1065,6 +1188,16 @@ void Discover()
     GridTerminalSystem.GetBlocksOfType(cargo, b => b.CubeGrid == grid);
     GridTerminalSystem.GetBlocksOfType(gyros, b => b.CubeGrid == grid);
     GridTerminalSystem.GetBlocksOfType(thrusters, b => b.CubeGrid == grid);
+    GridTerminalSystem.GetBlocksOfType(batteries, b => b.CubeGrid == grid);
+
+    // Gas tanks whose subtype names them a Hydrogen tank feed the fuel gate; oxygen
+    // tanks are ignored. Ships with no hydrogen tanks just skip the hydrogen check.
+    var tanks = new List<IMyGasTank>();
+    GridTerminalSystem.GetBlocksOfType(tanks, b => b.CubeGrid == grid);
+    h2Tanks.Clear();
+    foreach (var t in tanks)
+        if (t.BlockDefinition.SubtypeName.IndexOf("Hydrogen", StringComparison.OrdinalIgnoreCase) >= 0)
+            h2Tanks.Add(t);
 
     // Sorters are found by tag: any conveyor sorter whose name contains the
     // load/unload tag (case-insensitive). Name them anything - only the tag
@@ -1152,6 +1285,112 @@ double CargoFillPct()
     return max <= 0 ? 0 : cur / max * 100.0;
 }
 
+// ---- Remote / manual departure --------------------------------------------
+// Accept DEPART commands broadcast by a station PB. Command messages are tagged
+// "CMD|..." so they're never confused with the pipe-delimited status reports the
+// ship itself broadcasts on the same channel (which the base consumes).
+void DrainIgc()
+{
+    if (listener == null) return;
+    while (listener.HasPendingMessage)
+    {
+        var m = listener.AcceptMessage();
+        var s = m.Data as string;
+        if (string.IsNullOrEmpty(s) || !s.StartsWith("CMD|")) continue;   // ignore status broadcasts
+        var f = s.Split('|');
+        if (f.Length >= 2 && f[1] == "DEPART")
+        {
+            string who = f.Length >= 3 ? f[2] : "*";
+            if (who == "*" || who.Equals(shipName, StringComparison.OrdinalIgnoreCase))
+                RequestDepart();
+        }
+    }
+}
+
+// Latch a manual departure. Only meaningful while holding at a dock; the latch is
+// consumed when the shuttle actually leaves (and cleared by STOP / START).
+void RequestDepart()
+{
+    if (state == State.Loading || state == State.Unloading)
+    { departRequested = true; statusMsg = "Depart requested"; }
+    else statusMsg = "DEPART: not holding at a dock";
+}
+
+// ---- Fuel / charge gate ----------------------------------------------------
+// Current hydrogen fill across working H2 tanks, as a %. -1 when the ship has no
+// hydrogen tanks, so the hydrogen gate simply doesn't apply (battery/ion ships).
+double HydrogenPct()
+{
+    double cur = 0, cap = 0;
+    foreach (var t in h2Tanks)
+        if (t != null && t.IsWorking) { cap += t.Capacity; cur += t.FilledRatio * t.Capacity; }
+    return cap <= 0 ? -1 : cur / cap * 100.0;
+}
+
+// Current battery charge across working batteries, as a %. -1 when there are none.
+double BatteryPct()
+{
+    double cur = 0, cap = 0;
+    foreach (var b in batteries)
+        if (b != null && b.IsWorking) { cap += b.MaxStoredPower; cur += b.CurrentStoredPower; }
+    return cap <= 0 ? -1 : cur / cap * 100.0;
+}
+
+// May the shuttle depart on fuel grounds? Requires each resource (that the ship
+// actually has) to sit at or above the greater of its configured floor and the
+// last measured consumption for this leg direction plus the safety margin.
+bool DepartFuelOk(bool outbound, out string msg)
+{
+    double h2 = HydrogenPct();
+    double batt = BatteryPct();
+    double m = 1.0 + fuelMarginPct / 100.0;
+
+    double needH2 = minHydrogenPct;
+    double estH2 = outbound ? estHydroOut : estHydroHome;
+    if (estH2 > 0) needH2 = Math.Max(needH2, estH2 * m);
+
+    double needBatt = minBatteryPct;
+    double estB = outbound ? estBattOut : estBattHome;
+    if (estB > 0) needBatt = Math.Max(needBatt, estB * m);
+
+    if (h2 >= 0 && h2 < needH2)
+    { msg = "Hold: H2 " + h2.ToString("0") + "% < " + needH2.ToString("0") + "% to depart"; return false; }
+    if (batt >= 0 && batt < needBatt)
+    { msg = "Hold: Batt " + batt.ToString("0") + "% < " + needBatt.ToString("0") + "% to depart"; return false; }
+    msg = "";
+    return true;
+}
+
+// Snapshot fuel/charge at the start of a leg so its consumption can be measured on
+// arrival. `outbound` = home->dest; else dest->home.
+void BeginLegMeasure(bool outbound)
+{
+    legOutbound = outbound;
+    legStartH2 = HydrogenPct();
+    legStartBatt = BatteryPct();
+}
+
+// On arrival, record how much this leg burned (per direction) and persist it, so
+// the fuel gate learns the real cost of the run. Skipped if no leg was in progress
+// (e.g. a recompile mid-flight lost the start snapshot) - the prior estimate holds.
+void FinishLegMeasure()
+{
+    if (legStartH2 < 0 && legStartBatt < 0) return;
+    double h2 = HydrogenPct(), batt = BatteryPct();
+    if (legOutbound)
+    {
+        if (legStartH2 >= 0 && h2 >= 0) estHydroOut = Math.Max(0, legStartH2 - h2);
+        if (legStartBatt >= 0 && batt >= 0) estBattOut = Math.Max(0, legStartBatt - batt);
+    }
+    else
+    {
+        if (legStartH2 >= 0 && h2 >= 0) estHydroHome = Math.Max(0, legStartH2 - h2);
+        if (legStartBatt >= 0 && batt >= 0) estBattHome = Math.Max(0, legStartBatt - batt);
+    }
+    legStartH2 = -1; legStartBatt = -1;
+    SaveEstimates();
+}
+
 void AbortAutopilot()
 {
     if (rc == null) return;
@@ -1192,9 +1431,10 @@ int MenuCount()
 {
     switch (menuPage)
     {
-        case PAGE_MAIN:     return 5;   // Start/Stop, Run Mode, Go Home, Record, Settings
+        case PAGE_MAIN:     return 6;   // Start/Stop, Run Mode, Depart Now, Go Home, Record, Settings
         case PAGE_RECORD:   return 4;   // Home, Dest, Clear, Back
-        case PAGE_SETTINGS: return 5;   // Cruise, Dock, MaxMass, DepartFill, Back
+        case PAGE_SETTINGS: return 6;   // Cruise, Dock, MaxMass, DepartFill, Depart page, Back
+        case PAGE_DEPART:   return 7;   // Home trig, Dest trig, Dwell, MinH2, MinBatt, Margin, Back
         default:            return 1;
     }
 }
@@ -1216,9 +1456,10 @@ void MenuApply()
         {
             case 0: HandleCommand(operating ? "STOP" : "START"); break;
             case 1: CycleMode(); break;
-            case 2: HandleCommand("HOME"); break;
-            case 3: menuPage = PAGE_RECORD; menuIndex = 0; break;
-            case 4: menuPage = PAGE_SETTINGS; menuIndex = 0; break;
+            case 2: HandleCommand("DEPART"); break;
+            case 3: HandleCommand("HOME"); break;
+            case 4: menuPage = PAGE_RECORD; menuIndex = 0; break;
+            case 5: menuPage = PAGE_SETTINGS; menuIndex = 0; break;
         }
     }
     else if (menuPage == PAGE_RECORD)
@@ -1228,7 +1469,7 @@ void MenuApply()
             case 0: RecordHome(); break;
             case 1: RecordDest(); break;
             case 2: ClearRoute(); statusMsg = "Route cleared"; break;
-            case 3: menuPage = PAGE_MAIN; menuIndex = 3; break;
+            case 3: menuPage = PAGE_MAIN; menuIndex = 4; break;
         }
     }
     else if (menuPage == PAGE_SETTINGS)
@@ -1239,7 +1480,21 @@ void MenuApply()
             case 1: BeginEdit(dockSpeed); break;
             case 2: BeginEdit(maxMassKg / 1000.0); break;   // edit in tonnes
             case 3: BeginEdit(departFill); break;
-            case 4: menuPage = PAGE_MAIN; menuIndex = 4; break;
+            case 4: menuPage = PAGE_DEPART; menuIndex = 0; break;
+            case 5: menuPage = PAGE_MAIN; menuIndex = 5; break;
+        }
+    }
+    else if (menuPage == PAGE_DEPART)
+    {
+        switch (menuIndex)
+        {
+            case 0: CycleTrigger(true); break;
+            case 1: CycleTrigger(false); break;
+            case 2: BeginEdit(dwellSec); break;
+            case 3: BeginEdit(minHydrogenPct); break;
+            case 4: BeginEdit(minBatteryPct); break;
+            case 5: BeginEdit(fuelMarginPct); break;
+            case 6: menuPage = PAGE_SETTINGS; menuIndex = 4; break;
         }
     }
 }
@@ -1247,48 +1502,70 @@ void MenuApply()
 void MenuBack()
 {
     if (editing) { editing = false; statusMsg = "Edit cancelled"; return; }
-    if (menuPage != PAGE_MAIN) { menuPage = PAGE_MAIN; menuIndex = 0; }
+    if (menuPage == PAGE_DEPART) { menuPage = PAGE_SETTINGS; menuIndex = 4; }
+    else if (menuPage != PAGE_MAIN) { menuPage = PAGE_MAIN; menuIndex = 0; }
 }
 
 void CycleMode()
 {
     runMode = runMode == RunMode.Continuous ? RunMode.OneTrip
-            : runMode == RunMode.OneTrip ? RunMode.WaitFull
-            : runMode == RunMode.WaitFull ? RunMode.OneWay
+            : runMode == RunMode.OneTrip ? RunMode.OneWay
             : RunMode.Continuous;
     string s = runMode == RunMode.OneTrip ? "ONETRIP"
-             : runMode == RunMode.WaitFull ? "WAITFULL"
              : runMode == RunMode.OneWay ? "ONEWAY" : "CONTINUOUS";
     SaveCfg("runMode", s);
     statusMsg = "Mode = " + runMode;
+}
+
+// Cycle a per-connector departure trigger (APPLY on the Depart page), persisting it.
+void CycleTrigger(bool home)
+{
+    DepartTrigger t = home ? homeTrigger : destTrigger;
+    t = t == DepartTrigger.Auto ? DepartTrigger.Cargo
+      : t == DepartTrigger.Cargo ? DepartTrigger.Timer
+      : t == DepartTrigger.Timer ? DepartTrigger.Manual
+      : DepartTrigger.Auto;
+    if (home) homeTrigger = t; else destTrigger = t;
+    SaveCfg(home ? "homeTrigger" : "destTrigger", t.ToString());
+    statusMsg = (home ? "Home" : "Dest") + " trigger = " + t;
 }
 
 void BeginEdit(double v) { editing = true; editValue = v; }
 
 double EditStep()
 {
-    if (menuPage != PAGE_SETTINGS) return 1;
-    switch (menuIndex)
-    {
-        case 0: return 5;      // cruise m/s
-        case 1: return 0.5;    // dock m/s
-        case 2: return 1;      // max mass tonnes
-        case 3: return 5;      // depart fill %
-        default: return 1;
-    }
+    if (menuPage == PAGE_SETTINGS)
+        switch (menuIndex)
+        {
+            case 0: return 5;      // cruise m/s
+            case 1: return 0.5;    // dock m/s
+            case 2: return 1;      // max mass tonnes
+            case 3: return 5;      // depart fill %
+        }
+    if (menuPage == PAGE_DEPART) return 5;   // dwell s / min H2 % / min batt % / margin %
+    return 1;
 }
 
 void AdjustEdit(int dir) { editValue = Math.Round(editValue + dir * EditStep(), 2); }
 
 void CommitEdit()
 {
-    switch (menuIndex)
-    {
-        case 0: cruiseSpeed = (float)Clamp(editValue, 5, 1000); SaveCfg("cruiseSpeed", cruiseSpeed); break;
-        case 1: dockSpeed   = (float)Clamp(editValue, 0.5, 20); SaveCfg("dockSpeed", dockSpeed); break;
-        case 2: maxMassKg   = Clamp(editValue, 0, 100000) * 1000.0; SaveCfg("maxMassKg", maxMassKg); break;
-        case 3: departFill  = Clamp(editValue, 0, 100); SaveCfg("departFill", departFill); break;
-    }
+    if (menuPage == PAGE_SETTINGS)
+        switch (menuIndex)
+        {
+            case 0: cruiseSpeed = (float)Clamp(editValue, 5, 1000); SaveCfg("cruiseSpeed", cruiseSpeed); break;
+            case 1: dockSpeed   = (float)Clamp(editValue, 0.5, 20); SaveCfg("dockSpeed", dockSpeed); break;
+            case 2: maxMassKg   = Clamp(editValue, 0, 100000) * 1000.0; SaveCfg("maxMassKg", maxMassKg); break;
+            case 3: departFill  = Clamp(editValue, 0, 100); SaveCfg("departFill", departFill); break;
+        }
+    else if (menuPage == PAGE_DEPART)
+        switch (menuIndex)
+        {
+            case 2: dwellSec       = Clamp(editValue, 0, 3600); SaveCfg("dwellSec", dwellSec); break;
+            case 3: minHydrogenPct = Clamp(editValue, 0, 100); SaveCfg("minHydrogenPct", minHydrogenPct); break;
+            case 4: minBatteryPct  = Clamp(editValue, 0, 100); SaveCfg("minBatteryPct", minBatteryPct); break;
+            case 5: fuelMarginPct  = Clamp(editValue, 0, 200); SaveCfg("fuelMarginPct", fuelMarginPct); break;
+        }
     statusMsg = "Saved";
 }
 
@@ -1310,6 +1587,7 @@ List<string> MenuLabels()
     {
         l.Add(operating ? "Stop" : "Start");
         l.Add("Mode: " + runMode);
+        l.Add("Depart Now");
         l.Add("Go Home");
         l.Add("Record >>");
         l.Add("Settings >>");
@@ -1327,6 +1605,17 @@ List<string> MenuLabels()
         l.Add("Dock: " + FmtSetting(1, dockSpeed) + " m/s");
         l.Add("MaxMass: " + FmtSetting(2, maxMassKg / 1000.0) + "t" + (maxMassKg <= 0 ? " off" : ""));
         l.Add("Fill: " + FmtSetting(3, departFill) + " %");
+        l.Add("Depart >>");
+        l.Add("<< Back");
+    }
+    else if (menuPage == PAGE_DEPART)
+    {
+        l.Add("Home trig: " + homeTrigger);
+        l.Add("Dest trig: " + destTrigger);
+        l.Add("Dwell: " + FmtSetting(2, dwellSec) + " s");
+        l.Add("Min H2: " + FmtSetting(3, minHydrogenPct) + " %");
+        l.Add("Min Bat: " + FmtSetting(4, minBatteryPct) + " %");
+        l.Add("Margin: " + FmtSetting(5, fuelMarginPct) + " %");
         l.Add("<< Back");
     }
     return l;
@@ -1342,7 +1631,9 @@ string FmtSetting(int idx, double current)
 
 string PageName()
 {
-    return menuPage == PAGE_RECORD ? "RECORD" : menuPage == PAGE_SETTINGS ? "SETTINGS" : "MAIN";
+    return menuPage == PAGE_RECORD ? "RECORD"
+         : menuPage == PAGE_SETTINGS ? "SETTINGS"
+         : menuPage == PAGE_DEPART ? "DEPART" : "MAIN";
 }
 
 // ============================================================================
@@ -1585,12 +1876,13 @@ void BackfillConfig()
 void WriteShuttleSection(MyIni ini)
 {
     string modeStr = runMode == RunMode.OneTrip ? "ONETRIP"
-                   : runMode == RunMode.WaitFull ? "WAITFULL"
                    : runMode == RunMode.OneWay ? "ONEWAY" : "CONTINUOUS";
     ini.Set("shuttle", "role", role == Role.Base ? "base" : "shuttle");
     ini.Set("shuttle", "shipName", shipName);
     ini.Set("shuttle", "channel", channel);
     ini.Set("shuttle", "runMode", modeStr);
+    ini.Set("shuttle", "homeTrigger", homeTrigger.ToString());
+    ini.Set("shuttle", "destTrigger", destTrigger.ToString());
     ini.Set("shuttle", "remoteName", remoteName);
     ini.Set("shuttle", "loadTag", loadTag);
     ini.Set("shuttle", "unloadTag", unloadTag);
@@ -1600,6 +1892,10 @@ void WriteShuttleSection(MyIni ini)
     ini.Set("shuttle", "maxMassKg", maxMassKg);
     ini.Set("shuttle", "departFill", departFill);
     ini.Set("shuttle", "unloadDrainSec", unloadDrainSec);
+    ini.Set("shuttle", "dwellSec", dwellSec);
+    ini.Set("shuttle", "minHydrogenPct", minHydrogenPct);
+    ini.Set("shuttle", "minBatteryPct", minBatteryPct);
+    ini.Set("shuttle", "fuelMarginPct", fuelMarginPct);
     ini.Set("shuttle", "segMeters", segMeters);
     ini.Set("shuttle", "turnDegrees", turnDegrees);
     ini.Set("shuttle", "approachDist", approachDist);
@@ -1617,7 +1913,15 @@ void LoadConfig()
     role = ini.Get("shuttle", "role").ToString("shuttle").Trim().ToLower() == "base" ? Role.Base : Role.Shuttle;
     shipName = ini.Get("shuttle", "shipName").ToString(shipName);
     channel = ini.Get("shuttle", "channel").ToString(channel);
-    SetModeSilent(ini.Get("shuttle", "runMode").ToString("CONTINUOUS"));
+    // Run mode. Legacy WAITFULL folds into Continuous + a Cargo home trigger, but
+    // only supplies that default if no explicit homeTrigger key is present, so a new
+    // config's homeTrigger always wins.
+    string modeStr = ini.Get("shuttle", "runMode").ToString("CONTINUOUS").Trim().ToUpperInvariant();
+    string defHome = "Auto";
+    if (modeStr == "WAITFULL") { runMode = RunMode.Continuous; defHome = "Cargo"; }
+    else SetModeSilent(modeStr);
+    homeTrigger = TrigFromString(ini.Get("shuttle", "homeTrigger").ToString(defHome));
+    destTrigger = TrigFromString(ini.Get("shuttle", "destTrigger").ToString("Auto"));
     remoteName = ini.Get("shuttle", "remoteName").ToString("");
     // Sorter tags; fall back to the legacy exact-name keys (a full name still
     // matches as a substring tag), else the defaults.
@@ -1629,6 +1933,10 @@ void LoadConfig()
     maxMassKg = ini.Get("shuttle", "maxMassKg").ToDouble(maxMassKg);
     departFill = ini.Get("shuttle", "departFill").ToDouble(departFill);
     unloadDrainSec = ini.Get("shuttle", "unloadDrainSec").ToDouble(unloadDrainSec);
+    dwellSec = ini.Get("shuttle", "dwellSec").ToDouble(dwellSec);
+    minHydrogenPct = Clamp(ini.Get("shuttle", "minHydrogenPct").ToDouble(minHydrogenPct), 0, 100);
+    minBatteryPct = Clamp(ini.Get("shuttle", "minBatteryPct").ToDouble(minBatteryPct), 0, 100);
+    fuelMarginPct = Math.Max(0, ini.Get("shuttle", "fuelMarginPct").ToDouble(fuelMarginPct));
     segMeters = ini.Get("shuttle", "segMeters").ToDouble(segMeters);
     turnDegrees = ini.Get("shuttle", "turnDegrees").ToDouble(turnDegrees);
     approachDist = ini.Get("shuttle", "approachDist").ToDouble(approachDist);
@@ -1644,9 +1952,20 @@ void SetModeSilent(string m)
     switch (m.Trim().ToUpperInvariant())
     {
         case "ONETRIP":  runMode = RunMode.OneTrip; break;
-        case "WAITFULL": runMode = RunMode.WaitFull; break;
         case "ONEWAY":   runMode = RunMode.OneWay; break;
-        default:         runMode = RunMode.Continuous; break;
+        default:         runMode = RunMode.Continuous; break;   // incl. legacy WAITFULL (home trigger set by LoadConfig)
+    }
+}
+
+// Parse a DepartTrigger name (case-insensitive), defaulting to Auto.
+DepartTrigger TrigFromString(string s)
+{
+    switch (s.Trim().ToUpperInvariant())
+    {
+        case "CARGO":  return DepartTrigger.Cargo;
+        case "TIMER":  return DepartTrigger.Timer;
+        case "MANUAL": return DepartTrigger.Manual;
+        default:       return DepartTrigger.Auto;
     }
 }
 
@@ -1759,7 +2078,24 @@ void LoadState()
     Enum.TryParse(ini.Get("state", "state").ToString("Idle"), out state);
     operating = ini.Get("state", "operating").ToBoolean(false);
     phaseTimer = ini.Get("state", "phaseTimer").ToDouble(0);
+    estHydroOut = ini.Get("state", "estHydroOut").ToDouble(0);
+    estBattOut = ini.Get("state", "estBattOut").ToDouble(0);
+    estHydroHome = ini.Get("state", "estHydroHome").ToDouble(0);
+    estBattHome = ini.Get("state", "estBattHome").ToDouble(0);
     cruiseArmed = false;  // always re-arm autopilot after a recompile
+}
+
+// Persist just the learned per-leg fuel/charge estimates (called on arrival), so a
+// recompile doesn't forget what the run costs.
+void SaveEstimates()
+{
+    var ini = new MyIni();
+    ini.TryParse(Me.CustomData);
+    ini.Set("state", "estHydroOut", estHydroOut);
+    ini.Set("state", "estBattOut", estBattOut);
+    ini.Set("state", "estHydroHome", estHydroHome);
+    ini.Set("state", "estBattHome", estBattHome);
+    Me.CustomData = ini.ToString();
 }
 
 // ---- Vector <-> string -----------------------------------------------------

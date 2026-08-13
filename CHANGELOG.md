@@ -4,6 +4,44 @@ All notable changes to SkippyShuttle are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.9.0] - 2026-08-13
+
+### Added
+- **Per-connector departure triggers — a new setting, separate from the run mode.**
+  Each end now decides for itself what releases the shuttle to the next leg, PAM-style,
+  via `homeTrigger` and `destTrigger` (each `Auto` | `Cargo` | `Timer` | `Manual`):
+  - **Auto** — leave as soon as the cargo op finishes (loaded at home / emptied at the
+    destination, keeping the drain-timeout safety net). This is the previous behaviour,
+    so an unconfigured shuttle runs exactly as before.
+  - **Cargo** — wait for the hold to be genuinely full at home / empty at the destination.
+  - **Timer** — run the sorters for `dwellSec`, then depart regardless of fill.
+  - **Manual** — hold at the dock until a `DEPART` command arrives.
+  Run mode (`CONTINUOUS` / `ONETRIP` / `ONEWAY`) now governs only the trip *cycle*.
+- **`DEPART` command — manual release, locally or from the station.** On the ship it
+  releases the current dock immediately (and overrides any trigger); it's also the
+  Main-menu **Depart Now** item. On a base PB, `DEPART` broadcasts the request to all
+  shuttles and `DEPART <shipName>` targets one, so a station can send a waiting shuttle
+  on its way over IGC. The ship now registers an IGC listener for these commands
+  (command messages are tagged `CMD|…` so they never collide with the status board).
+- **Fuel / battery departure gate.** The shuttle won't leave a dock without enough
+  hydrogen and charge to reach the next one. It measures what each leg actually costs
+  (per direction, persisted across recompiles) and requires the current level to clear
+  that estimate plus a margin, floored by hard minimums:
+  - `minHydrogenPct` (default 10; ignored if the ship has no hydrogen tanks),
+  - `minBatteryPct` (default 10; ignored if it has no batteries),
+  - `fuelMarginPct` (default 25) — headroom on the measured per-leg estimate.
+  When gated it holds at the dock with a "low H2/charge" status and departs once the
+  level is met — it never faults.
+- LCD **Depart** submenu (under Settings): cycle each end's trigger and edit
+  `dwellSec` / `minHydrogenPct` / `minBatteryPct` / `fuelMarginPct` in place.
+
+### Changed
+- `RunMode` no longer includes `WaitFull`; departure conditions moved to the new
+  triggers. **Back-compat:** a config that still says `runMode = WAITFULL` (or a live
+  `MODE WAITFULL`) loads as `Continuous` + `homeTrigger = Cargo` — the same behaviour
+  under the new model — and an explicit `homeTrigger` in Custom Data always wins.
+- The Run Mode menu/`MODE` cycle is now Continuous → OneTrip → OneWay.
+
 ## [0.8.1] - 2026-08-13
 
 ### Fixed

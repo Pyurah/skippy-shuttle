@@ -4,9 +4,9 @@ Master tracking document for the SkippyShuttle Programmable Block script.
 
 ## Current status
 
-- **Version:** 0.8.1
-- **Phase:** 1 (Core shuttle) + LCD UI + orientation-matched docking — delivered, pending
-  in-world validation
+- **Version:** 0.9.0
+- **Phase:** 1 (Core shuttle) + LCD UI + orientation-matched docking + per-connector departure
+  triggers — delivered, pending in-world validation
 - **Environment:** Space Engineers in-game Programmable Block (single-file C#, no external
   build/test tooling available)
 
@@ -26,7 +26,8 @@ Master tracking document for the SkippyShuttle Programmable Block script.
 | Connector auto-connect / disconnect | ✅ | Connectable → `Connect()`; timeout → Faulted |
 | Load/unload sorter control | ✅ | Toggles Enabled only; filters left untouched |
 | Mass gate + fill-based departure | ✅ | `maxMassKg`, `departFill` |
-| Four run modes (Continuous / OneTrip / WaitFull / OneWay) | ✅ | Config key + `MODE` command; OneWay added v0.8.0 |
+| Four run modes (Continuous / OneTrip / OneWay) | ✅ | Config key + `MODE` command; OneWay added v0.8.0. WaitFull folded into a departure trigger (v0.9.0) |
+| Per-connector departure triggers (Auto/Cargo/Timer/Manual) | ✅ | `homeTrigger`/`destTrigger`; separate from run mode; `DEPART` override (v0.9.0) |
 | Ship LCD status + ETA | ✅ | ETA from remaining waypoint distance / speed |
 | IGC broadcast + base board with NO-SIGNAL handling | ✅ | Pipe-delimited report, 20 s stale timeout |
 
@@ -102,6 +103,24 @@ docked connector (live), so it always knows which end it's sitting at across res
 - [ ] Field-confirm: dispatch home→station holds at the station; a second `START` returns
       home and holds; mode survives a recompile mid-hold.
 
+## Phase 1.9 — per-connector departure triggers ✅ delivered (v0.9.0)
+
+Split the departure *condition* out of `RunMode` into its own per-end setting, PAM-style, plus a
+manual `DEPART` (local + remote) and a fuel/battery gate.
+
+- [x] `DepartTrigger { Auto, Cargo, Timer, Manual }`; `homeTrigger` / `destTrigger` fields + config keys.
+- [x] `DepartureAllowed(atHome, cargoReady)` gates Loading→UndockHome and Unloading→UndockDest
+      (dwell via `phaseTimer`, `departRequested` override) — no new enum states.
+- [x] `DEPART [shipName]` run-arg + Main-menu "Depart Now"; ship registers an IGC listener and
+      drains `CMD|DEPART|…` messages; base role broadcasts `DEPART` to the channel.
+- [x] Fuel/battery gate: `minHydrogenPct`/`minBatteryPct` floors + adaptive per-direction estimate
+      (measured, persisted in `[state]`, required with `fuelMarginPct` margin). Hold + status, no fault.
+- [x] Discover `IMyGasTank` (hydrogen only, by subtype) + `IMyBatteryBlock`; skip a check if none.
+- [x] LCD **Depart** page (cycle triggers; edit dwell/floors/margin); config load/save/backfill.
+- [x] **Back-compat:** `runMode = WAITFULL` (config or `MODE`) loads as `Continuous` + `homeTrigger = Cargo`.
+- [ ] Field-confirm: each end honors its trigger; Manual holds until `DEPART` (ship + base both release);
+      Timer dwells; Cargo waits full/empty; Auto unchanged; fuel gate holds then departs when met.
+
 ## Phase 2 — Air-traffic control & connector discovery (recommended next)
 
 Enables stations to publish landing pads and coordinate arrivals. The docking controller
@@ -134,7 +153,9 @@ Delivered into the core (was conditional). Docking is no longer nose-first-only.
 
 ## Phase 2c — flight robustness (planned)
 
-- [ ] Low-battery / low-hydrogen guard: refuse departure or divert home.
+- [x] Low-battery / low-hydrogen guard: refuse departure until the level covers the next leg
+      (adaptive per-direction estimate + hard floors, delivered v0.9.0). *Divert-home-if-stranded
+      is not implemented — the shuttle holds at the dock rather than launching under-fuelled.*
 - [ ] Multi-stop routes (more than two connectors).
 - [ ] Per-item load manifests (fill specific items to target amounts).
 

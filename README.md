@@ -39,7 +39,13 @@ two docking points (for example, a planet base and an orbital station).
 | `role` | `shuttle` | `shuttle` (flies) or `base` (renders the board) |
 | `shipName` | `Skippy` | Label shown on the base board |
 | `channel` | `SkippyShuttleNet` | IGC channel — **must match** on ship and base |
-| `runMode` | `CONTINUOUS` | `CONTINUOUS`, `ONETRIP`, `WAITFULL`, or `ONEWAY` |
+| `runMode` | `CONTINUOUS` | Trip cycle: `CONTINUOUS`, `ONETRIP`, or `ONEWAY` (departure is a *separate* setting — see below) |
+| `homeTrigger` | `Auto` | What releases the shuttle **from home**: `Auto`, `Cargo`, `Timer`, `Manual` |
+| `destTrigger` | `Auto` | What releases the shuttle **from the destination** (same four options) |
+| `dwellSec` | `30` | `Timer` trigger: seconds to run the sorters before departing regardless of fill |
+| `minHydrogenPct` | `10` | Hard floor — never depart below this hydrogen %. Ignored if the ship has no hydrogen tanks |
+| `minBatteryPct` | `10` | Hard floor — never depart below this battery charge %. Ignored if the ship has no batteries |
+| `fuelMarginPct` | `25` | Safety margin on the measured per-leg fuel/charge estimate |
 | `remoteName` | *(blank)* | Blank = auto-find a Remote Control on the grid |
 | `loadTag` | `[SHUTTLE:LOAD]` | Sorters whose name **contains** this tag load cargo at home |
 | `unloadTag` | `[SHUTTLE:UNLOAD]` | Sorters whose name **contains** this tag unload at the destination |
@@ -87,7 +93,8 @@ settings are left untouched.
 | `START` / `GO` | Begin operating per the run mode |
 | `STOP` | Abort the flight, turn sorters off, return to Idle |
 | `HOME` | Fly back to the home connector and dock |
-| `MODE CONTINUOUS\|ONETRIP\|WAITFULL\|ONEWAY` | Change the run mode live |
+| `DEPART` | Release the shuttle from the dock it's holding at **now** (overrides its trigger) |
+| `MODE CONTINUOUS\|ONETRIP\|ONEWAY` | Change the run mode live (`WAITFULL` still accepted — maps to Continuous + `homeTrigger=Cargo`) |
 | `RESUME` | Continue the saved state after a recompile |
 | `CLEARROUTE` | Erase the recorded route |
 | `UP` / `DOWN` | Move the LCD menu cursor (or change a value while editing) |
@@ -101,17 +108,25 @@ from the **on-screen menu**. Bind four cockpit toolbar buttons to run the PB wit
 arguments `UP`, `DOWN`, `APPLY`, and `BACK`. The ship's tagged LCDs (and the PB's own screen)
 show a status header with a `>` cursor menu beneath it:
 
-- **Main:** Start/Stop, Run Mode (APPLY cycles it), Go Home, and entries into the submenus.
+- **Main:** Start/Stop, Run Mode (APPLY cycles it), **Depart Now**, Go Home, and entries into
+  the submenus. *Depart Now* releases the shuttle from the dock it's holding at right now.
 - **Record:** Record Home connector, Record Dest connector, Clear Route.
-- **Settings:** Cruise Speed, Dock Speed, Max Mass (tonnes), Depart Fill % — `APPLY` to edit,
-  `UP`/`DOWN` to change, `APPLY` to save, `BACK` to cancel. Every saved value is written back
-  to Custom Data, so it survives recompiles.
+- **Settings:** Cruise Speed, Dock Speed, Max Mass (tonnes), Depart Fill %, and a **Depart >>**
+  entry into the departure page — `APPLY` to edit, `UP`/`DOWN` to change, `APPLY` to save, `BACK`
+  to cancel. Every saved value is written back to Custom Data, so it survives recompiles.
+- **Depart:** cycle **Home Trigger** / **Dest Trigger** (Auto/Cargo/Timer/Manual) and edit
+  **Dwell** (Timer seconds), **Min H2 %**, **Min Batt %**, and **Fuel Margin %** in place.
 
-### Run modes
+### Run modes vs. departure triggers
+
+The **run mode** decides the *trip cycle*; the **departure trigger** decides *when each leg
+starts*. They're independent — e.g. `CONTINUOUS` + `homeTrigger=Manual` loops forever but waits
+for a `DEPART` at home each time.
+
+**Run modes (`runMode`):**
 
 - **CONTINUOUS** — loops forever: load → fly → unload → return → repeat, until `STOP`.
 - **ONETRIP** — one round trip on `START`/`GO`, then waits.
-- **WAITFULL** — like continuous, but only departs once cargo reaches `departFill`%.
 - **ONEWAY** — one leg per `START`, then **holds at the far end** instead of returning.
   Docked at home, it loads, flies to the station, unloads, and waits there. The next
   `START` flies it straight back home and waits again. It decides which way to go from
@@ -120,11 +135,39 @@ show a status header with a `>` cursor menu beneath it:
   knows whether it's sitting at home or at the station — you never have to tell it. Good
   for "take this load over and stay put until I send you back."
 
+**Departure triggers (`homeTrigger` / `destTrigger`, per end):**
+
+- **Auto** *(default)* — leave as soon as the cargo op finishes (loaded at home / emptied at the
+  destination, keeping the unload drain-timeout safety net). This is the pre-0.9.0 behaviour.
+- **Cargo** — wait until the hold is genuinely full at home (`departFill`% / mass gate) or empty
+  at the destination before leaving. This is what the old `WAITFULL` mode did.
+- **Timer** — run the sorters for `dwellSec`, then depart regardless of fill.
+- **Manual** — hold at the dock until a `DEPART` arrives (the ship's *Depart Now* button, the
+  `DEPART` run-arg, or a `DEPART` broadcast from the base). Nothing leaves on its own.
+
+A `DEPART` (button or command) always overrides the current trigger and releases the shuttle
+immediately — subject only to the fuel/battery gate below.
+
+### Fuel & battery gate
+
+Whatever the trigger says, the shuttle won't leave a dock without enough hydrogen **and** charge
+to reach the next one. It measures what each leg actually costs (per direction, and remembers it
+across recompiles) and requires the current level to clear that estimate plus `fuelMarginPct`,
+never dropping below the `minHydrogenPct` / `minBatteryPct` floors. Before it has flown a leg it
+uses the floors alone. When it's gated it simply **holds at the dock** with a "low H2/charge"
+status and departs the moment the level is met — it never faults. A ship with no hydrogen tanks
+skips the hydrogen check; one with no batteries skips the charge check.
+
 ## Base board
 
 Set a base PB to `role = base` and the same `channel`. Tag base LCDs with `[SHUTTLE]`
 (or your `lcdTag`). The board shows each shuttle's state, ETA, distance, cargo % and mass,
 and flags **NO SIGNAL** if a shuttle drops off the network (e.g. beyond antenna range).
+
+The base PB also accepts a `DEPART` run-argument: `DEPART` releases every shuttle on the channel
+that's holding at a dock, and `DEPART <shipName>` targets just one. So a station can send a
+waiting shuttle on its way without anyone touching the ship — provided the two are in antenna
+range of each other (see the range note above).
 
 > Antenna range is 50 km; your run is 78 km. Place one relay antenna near the midpoint if
 > you want an unbroken board — the shuttle still flies fine without signal; only the board
@@ -157,5 +200,10 @@ and flags **NO SIGNAL** if a shuttle drops off the network (e.g. beyond antenna 
   the world cap won't make the ship go faster — the game clamps it.
 - Routes recorded by v0.1–0.2 stored position only; they still load, with orientation
   synthesised as a nose-first approach. Re-record them to capture true orientation.
+- The **fuel/battery departure gate learns by flying.** Its per-leg estimate is measured from the
+  last completed leg in each direction, so the *first* departure after a fresh compile (or after
+  re-recording the route) is gated only by the `minHydrogenPct` / `minBatteryPct` floors — set
+  those high enough to cover a leg if you don't want to rely on the first measurement. A ship with
+  no hydrogen tanks or no batteries skips that half of the check entirely.
 - This is an in-game PB script; it cannot be unit-tested outside Space Engineers. Validation
   is in-world (see [roadmap.md](roadmap.md)).
