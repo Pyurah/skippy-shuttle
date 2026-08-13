@@ -1,102 +1,45 @@
 /*//////////////////////////////////////////////////////////////////////////////
- * SkippyShuttle - Autonomous two-connector delivery shuttle for Space Engineers
- * ------------------------------------------------------------------------------
- * A purpose-built replacement for PAM when all you need is a delivery shuttle
- * that ferries cargo between two docking points (e.g. a planet base and an
- * orbital station).
+ * SkippyShuttle - Autonomous two-connector delivery shuttle for Space Engineers.
+ * A PAM replacement for pure ferry duty: cargo between two docks (e.g. a planet
+ * base and an orbital station). Full docs in README.md / CHANGELOG.md.
  *
- * ONE script, TWO roles - paste the SAME code into both Programmable Blocks:
- *   - The SHIP PB   (role = shuttle) flies the route and manages cargo.
- *   - The BASE PB   (role = base)    listens on the channel and renders the
- *                                    status + ETA of every shuttle to LCDs.
- * The role is read from the PB's Custom Data (see the [shuttle] section below).
+ * ONE script, TWO roles - paste into both PBs; role is set in Custom Data:
+ *   role = shuttle : flies the route and manages cargo.
+ *   role = base    : renders every shuttle's status + ETA to tagged LCDs.
+ *                    ("station" is accepted as an alias for base.)
  *
- * ------------------------------------------------------------------------------
- * QUICK START (ship)
- *   1. Put this script in the ship's Programmable Block. Recompile once.
- *      It writes a default config into Custom Data - edit it, recompile again.
- *   2. Manually dock the ship at its HOME connector, then run:  RECORD HOME
- *   3. Fly the ship by hand to the destination. The script records the path.
- *   4. Manually dock at the DESTINATION connector, then run:    RECORD DEST
- *      (The route is now saved to Custom Data under [route] - copy that whole
- *       section to any other identical ship to share the route.)
- *   5. Run:  START     (behaviour depends on the configured run mode)
+ * QUICK START (ship): recompile once (writes a Custom Data template, edit + recompile
+ * again) -> dock at home, RECORD HOME -> fly to the destination by hand -> dock there,
+ * RECORD DEST (route saved under [route]; copy that section to clone it) -> START.
  *
- * COMMANDS (run-argument on the ship PB)
- *   RECORD HOME   Bind the currently-docked connector as the home point and
- *                 begin recording the outbound path.
- *   RECORD DEST   Bind the currently-docked connector as the destination and
- *                 finish recording the path. Route is saved.
- *   START / GO    Begin operating (loads, flies, unloads per the run mode).
- *   STOP          Abort autopilot and return to Idle (stays docked/where it is).
- *   HOME          Fly back to the home connector and dock.
- *   DEPART        Release the shuttle from the dock NOW (manual trigger / override).
- *                 On a base PB it broadcasts the request: DEPART (all shuttles) or
- *                 DEPART <shipName> (one), so a station can send the ship on its way.
- *   MODE CONTINUOUS | ONETRIP | ONEWAY   Change the run mode live.
- *   RESUME        Continue the saved state after a recompile.
- *   CLEARROUTE    Erase the recorded route.
- *   UP / DOWN     Move the LCD menu cursor (bind to cockpit toolbar buttons).
- *   APPLY         Select the highlighted menu item / save a value being edited.
- *   BACK          Leave a submenu / cancel a value edit.
+ * COMMANDS (run-arg on the ship PB): RECORD HOME | RECORD DEST | START/GO | STOP |
+ *   HOME | DEPART (release the current dock now; on a base PB broadcasts DEPART, or
+ *   DEPART <shipName>, to the fleet) | MODE CONTINUOUS|ONETRIP|ONEWAY | RESUME |
+ *   CLEARROUTE | UP | DOWN | APPLY | BACK (the last four drive the on-screen menu).
  *
- * CUSTOM DATA (auto-generated template, all keys optional except role)
- *   [shuttle]
- *   role         = shuttle            ; shuttle | base
- *   shipName     = Skippy             ; label shown on base screens
- *   channel      = SkippyShuttleNet   ; IGC broadcast channel (must match base)
- *   runMode      = CONTINUOUS         ; CONTINUOUS | ONETRIP | ONEWAY (trip cycle)
- *   homeTrigger  = Auto               ; Auto | Cargo | Timer | Manual - releases from HOME
- *   destTrigger  = Auto               ; Auto | Cargo | Timer | Manual - releases from DEST
- *   remoteName   =                    ; blank = auto-find a Remote Control
- *   loadTag      = [SHUTTLE:LOAD]      ; sorters with this tag in their name load cargo
- *   unloadTag    = [SHUTTLE:UNLOAD]    ; sorters with this tag in their name unload cargo
- *   lcdTag       = [SHUTTLE]          ; LCDs whose name contains this show status
- *   cruiseSpeed  = 100                ; [m/s] cruise speed cap
- *   dockSpeed    = 5                  ; [m/s] final-approach cap (precision mode)
- *   maxMassKg    = 0                  ; 0 = no mass gate; else stop loading here
- *   departFill   = 95                 ; [%] cargo fill that triggers departure
- *   unloadDrainSec = 30              ; [s] max time to spend unloading (Auto dest trigger)
- *   dwellSec     = 30                 ; [s] Timer-trigger dwell at a dock before departing
- *   minHydrogenPct = 10               ; [%] refuse to depart below this H2 level (0/no tanks = off)
- *   minBatteryPct  = 10               ; [%] refuse to depart below this battery charge
- *   fuelMarginPct  = 25               ; [%] headroom on the measured per-leg fuel/charge cost
- *   segMeters    = 250                ; breadcrumb spacing on straightaways
- *   turnDegrees  = 12                 ; extra breadcrumb when heading turns this much
- *   approachDist = 15                 ; [m] on-axis stand-off where docking takes over
- *   gyroRpmCap   = 0                  ; gyro rate cap [rpm]; 0 = auto (15 small grid / 5 large)
- *   brakeFrac    = 0.6                ; fraction of thrust reserved for braking/cornering (0.1-1.0)
- *   cornerLen    = 30                 ; [m] corner-rounding length + look-ahead blend distance
- *   gyroGain     = 4                  ; attitude P gain (higher = snappier turns toward heading)
- *   gyroDamp     = 3                  ; attitude damping (raise if the ship wobbles / overshoots / jiggles)
+ * CONFIG: the [shuttle] Custom Data section (auto-generated; every key optional
+ * except role). See README.md for the full key table and semantics.
  *
- * NOTES
- *   - Coordinates are absolute world positions. This is correct for static
- *     grids (a planet base and a station never move). Do not use this to dock
- *     with a moving grid.
- *   - Docking is ORIENTATION-MATCHED and ship-agnostic. RECORD captures the full
- *     docked attitude (position + facing + the connector's mating axis), so the
- *     ship reproduces the exact pose it was recorded in - it works for a
- *     connector facing ANY direction, not just a nose-mounted one, and the same
- *     recorded/shared route flies correctly on any ship with gyros + thrusters.
- *   - A custom gyro + thruster controller flies the WHOLE route - takeoff,
- *     cruise, and the final approachDist metres into the dock. It follows the
- *     recorded breadcrumbs on a precomputed velocity profile (slow into turns,
- *     full speed on straights) and brakes smoothly into each point, so it never
- *     hands the cruise to the stock autopilot (which weaves and flies sideways).
- *     While flying it runs at 60 Hz for a steady heading (a slow loop overshoots
- *     and wobbles), turns the ship's DAMPENERS OFF, and coasts with thrust cut in
- *     space once up to speed - so a straight leg burns no fuel. Dampeners are
- *     restored whenever it stops, docks, faults, or is recompiled.
- *   - The script only toggles the tagged sorters on/off. Their whitelist/blacklist
- *     and Drain-All settings stay exactly as you configured them. Tag matching is
- *     case-insensitive and matches the tag anywhere in the block name, so you can
- *     name sorters however you like as long as the tag appears somewhere.
+ * SCREEN VIEWS: each ship screen shows ONE view so a multi-screen cockpit can split
+ * the display - full (header+menu, the default), menu, status, trip. Assign via a
+ * tagged LCD name ([SHUTTLE] = full, [SHUTTLE:trip], [SHUTTLE:menu:1.2] to pin the
+ * font, [SHUTTLE:status:1.4:6] to also pin 6% padding) or a [shuttle-screens] section
+ * in a cockpit/PB's own Custom Data mapping surface index -> view (e.g.
+ * "2 = status@1.4/6" = view@font/pad). Each screen sizes to its OWN content, so a
+ * small screen no longer shrinks a big wall LCD; an untagged rig is unchanged (full
+ * view). See ParseScreenTag / Discover.
  *
- * Version tracked in CHANGELOG.md. Semver.
+ * NOTES: absolute world coordinates - static grids only, never a moving grid.
+ * Docking is orientation-matched (RECORD captures the full docked pose), so it works
+ * for a connector facing any direction on any ship with gyros + thrusters. One custom
+ * gyro+thruster controller flies the whole route on a velocity profile (no stock
+ * autopilot weaving); at 60 Hz while flying it holds heading, turns DAMPENERS OFF and
+ * coasts thrust-free in space (restored on stop/dock/fault/recompile). Sorters are
+ * only toggled on/off (filters/Drain-All untouched); tag match is case-insensitive
+ * anywhere in the name. Version tracked in CHANGELOG.md. Semver.
  *//////////////////////////////////////////////////////////////////////////////
 
-const string VERSION = "0.9.0";
+const string VERSION = "0.12.2";
 
 // ---- Roles / states --------------------------------------------------------
 enum Role { Shuttle, Base }
@@ -210,6 +153,16 @@ int cruiseIdx = 0;                              // index of the waypoint current
 double cruiseAccel = 1.0;                       // [m/s^2] decel/lateral accel cached for this leg (mass-dependent)
 double cruiseProgTimer = 0;                     // seconds since the cursor last advanced (stuck watchdog)
 
+// ---- Display views (ship role) ---------------------------------------------
+// Each ship screen shows ONE view, so a 3-screen cockpit can split the display
+// (menu on one, trip info on another, a compact status on a third) instead of
+// cramming everything onto every panel. "full" is the whole header+menu (the
+// original layout) and stays the default, so any screen not explicitly assigned
+// looks exactly as before. A screen picks its view by name tag ([SHUTTLE:trip])
+// or, for a multi-surface block like a cockpit, a [shuttle-screens] section in
+// that block's Custom Data (see ParseScreenTag / Discover).
+const string VIEW_FULL = "full", VIEW_MENU = "menu", VIEW_STATUS = "status", VIEW_TRIP = "trip";
+
 // ---- LCD menu (ship role) --------------------------------------------------
 const int PAGE_MAIN = 0, PAGE_RECORD = 1, PAGE_SETTINGS = 2, PAGE_DEPART = 3;
 int menuPage = PAGE_MAIN;
@@ -227,8 +180,12 @@ List<IMyShipConnector> connectors = new List<IMyShipConnector>();
 List<IMyConveyorSorter> loadSorters = new List<IMyConveyorSorter>();
 List<IMyConveyorSorter> unloadSorters = new List<IMyConveyorSorter>();
 List<IMyCargoContainer> cargo = new List<IMyCargoContainer>();
-List<IMyTextSurface> screens = new List<IMyTextSurface>();
-IMyTextSurface pbSurface;                            // the PB's own screen (written, but not used to size)
+// A ship screen and the view it renders. FixedSize <= 0 = auto-fit to this surface;
+// > 0 pins that font size (for operators who don't want auto-resize). Pad is the
+// TextPadding (% per side); the auto-fit subtracts it so text still fits.
+struct ScreenTarget { public IMyTextSurface Surface; public string View; public float FixedSize; public float Pad; }
+List<ScreenTarget> shipScreens = new List<ScreenTarget>();
+IMyTextSurface pbSurface;                            // the PB's own screen (fallback full view when no [shuttle-screens] on it)
 List<IMyGyro> gyros = new List<IMyGyro>();          // final-approach attitude control
 List<IMyThrust> thrusters = new List<IMyThrust>();  // final-approach translation control
 List<IMyGasTank> h2Tanks = new List<IMyGasTank>();  // hydrogen tanks (fuel-gate reading)
@@ -243,7 +200,7 @@ double dt = DT_FALLBACK;                 // real elapsed time this tick; timers 
 double sinceRender = 0;                  // s since the last LCD render + broadcast (throttle at 60 Hz)
 const double APPROACH_TIMEOUT = 45;   // s to abort a stuck docking approach
 const int MAX_PATH = 250;
-const int WRAP_COLS = 26;             // ship LCD word-wrap width; keeps any one line from blowing out the shared font size
+const int WRAP_COLS = 26;             // ship LCD word-wrap width; keeps any one line from blowing out a screen's auto-fit font
 
 // ---- Docking controller tuning ---------------------------------------------
 const double APPROACH_KP = 0.5;     // desired approach speed = distance * this (capped at dockSpeed)
@@ -272,6 +229,7 @@ Program()
     if (string.IsNullOrWhiteSpace(Me.CustomData)) WriteConfigTemplate();
     LoadConfig();
     if (role == Role.Shuttle) BackfillConfig();   // add keys introduced by a newer version, keeping the route/state
+    else TrimBaseConfig();                         // a board ignores the flight/cargo keys - keep its config clean
     Discover();
     LoadRoute();
     LoadState();
@@ -1171,7 +1129,7 @@ void OnDocked(bool atDest)
 // ============================================================================
 void Discover()
 {
-    connectors.Clear(); cargo.Clear(); screens.Clear();
+    connectors.Clear(); cargo.Clear(); shipScreens.Clear();
     var grid = Me.CubeGrid;
 
     // Remote Control
@@ -1211,17 +1169,115 @@ void Discover()
         if (HasTag(s.CustomName, unloadTag)) unloadSorters.Add(s);
     }
 
-    // Status surfaces: any text panel whose name contains the tag, plus the PB.
-    // A small font keeps the full status header + menu on screen without clipping.
+    // Status surfaces. Two ways a screen picks its view:
+    //   1. A tagged text panel: name contains lcdTag, optionally with a view/size,
+    //      e.g. [SHUTTLE] (full), [SHUTTLE:trip], [SHUTTLE:menu:1.2].
+    //   2. A multi-surface block (cockpit, PB, ...) that OPTS IN via a
+    //      [shuttle-screens] section in its Custom Data mapping surface index -> view
+    //      (e.g. "0 = menu", "2 = status@1.4"). Opt-in, so it never hijacks an
+    //      unrelated cockpit. Each screen is later sized to its OWN content.
     var panels = new List<IMyTextPanel>();
-    GridTerminalSystem.GetBlocksOfType(panels, b => b.CustomName.Contains(lcdTag));
-    foreach (var p in panels) { PrepSurface(p); screens.Add(p); }
+    GridTerminalSystem.GetBlocksOfType(panels, b => b.CubeGrid == grid && HasTag(b.CustomName, TagOpener()));
+    foreach (var p in panels)
+    {
+        string view; float size, pad;
+        ParseScreenTag(p.CustomName, out view, out size, out pad);
+        AddScreen(p, view, size, pad);
+    }
+
+    // Multi-surface providers with a [shuttle-screens] config section.
+    var providers = new List<IMyTerminalBlock>();
+    GridTerminalSystem.GetBlocksOfType(providers, b => b.CubeGrid == grid
+        && b is IMyTextSurfaceProvider
+        && b.CustomData.IndexOf("shuttle-screens", StringComparison.OrdinalIgnoreCase) >= 0);
+    bool pbConfigured = false;
+    foreach (var b in providers)
+    {
+        var prov = b as IMyTextSurfaceProvider;
+        var ini = new MyIni();
+        if (!ini.TryParse(b.CustomData) || !ini.ContainsSection("shuttle-screens")) continue;
+        var keys = new List<MyIniKey>();
+        ini.GetKeys("shuttle-screens", keys);
+        foreach (var k in keys)
+        {
+            int idx;
+            if (!int.TryParse(k.Name.Trim(), out idx) || idx < 0 || idx >= prov.SurfaceCount) continue;
+            string view; float size, pad;
+            ParseViewSpec(ini.Get(k).ToString(""), out view, out size, out pad);
+            AddScreen(prov.GetSurface(idx), view, size, pad);
+        }
+        if (b == Me) pbConfigured = true;
+    }
+
+    // PB's own screen: full-view fallback unless the PB itself declared [shuttle-screens].
     pbSurface = Me.GetSurface(0);
-    PrepSurface(pbSurface);
+    if (!pbConfigured) { PrepSurface(pbSurface); AddScreen(pbSurface, VIEW_FULL, 0f, 0f); }
 }
 
-// Configure a surface for monospaced, left-aligned status text. The size is set
-// per-render by WriteShipScreens (one shared size across all panels).
+// The tag "opener" is lcdTag without a trailing ']', so [SHUTTLE] matches both the
+// plain tag and the extended [SHUTTLE:view] / [SHUTTLE:view:size] forms.
+string TagOpener()
+{
+    return lcdTag.EndsWith("]") ? lcdTag.Substring(0, lcdTag.Length - 1) : lcdTag;
+}
+
+// Prep + register a screen target, de-duplicating so the same surface isn't added
+// twice (e.g. a panel tagged AND listed in a [shuttle-screens] section).
+void AddScreen(IMyTextSurface s, string view, float size, float pad)
+{
+    if (s == null) return;
+    for (int i = 0; i < shipScreens.Count; i++) if (shipScreens[i].Surface == s) return;
+    PrepSurface(s);
+    shipScreens.Add(new ScreenTarget { Surface = s, View = view, FixedSize = size, Pad = pad });
+}
+
+// Parse the view (+ optional size + optional padding) out of a tagged panel name.
+// Accepts the tag opener then "]", ":view]", ":view:size]", or ":view:size:pad]".
+// Defaults to the full view, auto-fit font, zero padding.
+void ParseScreenTag(string name, out string view, out float size, out float pad)
+{
+    view = VIEW_FULL; size = 0f; pad = 0f;
+    string opener = TagOpener();
+    int i = name.IndexOf(opener, StringComparison.OrdinalIgnoreCase);
+    if (i < 0) return;
+    int start = i + opener.Length;
+    int end = name.IndexOf(']', start);
+    string inner = end > start ? name.Substring(start, end - start) : name.Substring(start);
+    // inner is "" (plain tag) or ":view" / ":view:size" / ":view:size:pad"
+    var parts = inner.Split(':');
+    // parts[0] is empty (text before the first ':') for the plain/extended tag
+    if (parts.Length >= 2 && parts[1].Trim().Length > 0) view = NormalizeView(parts[1]);
+    if (parts.Length >= 3) { float f; if (float.TryParse(parts[2].Trim(), out f) && f > 0) size = f; }
+    if (parts.Length >= 4) { float f; if (float.TryParse(parts[3].Trim(), out f) && f >= 0) pad = f; }
+}
+
+// Parse a "view", "view@size", "view@size/pad", or "view/pad" spec from a
+// [shuttle-screens] value. '@' pins the font size, '/' the padding (% per side).
+void ParseViewSpec(string spec, out string view, out float size, out float pad)
+{
+    view = VIEW_FULL; size = 0f; pad = 0f;
+    if (string.IsNullOrEmpty(spec)) return;
+    var pp = spec.Split('/');
+    if (pp.Length >= 2) { float f; if (float.TryParse(pp[1].Trim(), out f) && f >= 0) pad = f; }
+    var parts = pp[0].Split('@');
+    view = NormalizeView(parts[0]);
+    if (parts.Length >= 2) { float f; if (float.TryParse(parts[1].Trim(), out f) && f > 0) size = f; }
+}
+
+// Map a view name (case-insensitive) to a known view constant; unknown -> full.
+string NormalizeView(string v)
+{
+    switch (v.Trim().ToLowerInvariant())
+    {
+        case VIEW_MENU:   return VIEW_MENU;
+        case VIEW_STATUS: return VIEW_STATUS;
+        case VIEW_TRIP:   return VIEW_TRIP;
+        default:          return VIEW_FULL;
+    }
+}
+
+// Configure a surface for monospaced, left-aligned status text. The font size is
+// set per-render by SizeAndWrite (each screen sized to its own content).
 void PrepSurface(IMyTextSurface s)
 {
     s.ContentType = ContentType.TEXT_AND_IMAGE;
@@ -1307,13 +1363,38 @@ void DrainIgc()
     }
 }
 
-// Latch a manual departure. Only meaningful while holding at a dock; the latch is
-// consumed when the shuttle actually leaves (and cleared by STOP / START).
+// Manual "Depart Now" (ship button / station IGC). Two cases:
+//   - Mid-cycle, holding at a dock on a trigger (Loading/Unloading): latch the
+//     override so the phase releases now (still subject to the fuel gate). The
+//     latch is consumed when the shuttle actually leaves (cleared by STOP / START).
+//   - Parked Idle at a dock: begin operating and dispatch the next leg immediately,
+//     exactly the way START does (direction from which end we're physically at),
+//     with the override latched so we don't sit waiting on the trigger.
 void RequestDepart()
 {
     if (state == State.Loading || state == State.Unloading)
-    { departRequested = true; statusMsg = "Depart requested"; }
-    else statusMsg = "DEPART: not holding at a dock";
+    {
+        departRequested = true;
+        statusMsg = "Depart requested";
+        return;
+    }
+
+    if (state == State.Idle && haveRoute && DockedNow())
+    {
+        operating = true;
+        bool atHome = AtHomeEnd();
+        if (runMode == RunMode.OneWay)
+            state = atHome ? State.Loading : State.UndockDest;   // at dest -> straight home
+        else
+            state = atHome ? State.Loading : State.Unloading;
+        phaseTimer = 0;
+        departRequested = true;
+        statusMsg = "Departing now";
+        return;
+    }
+
+    if (operating) statusMsg = "DEPART: already under way";
+    else statusMsg = haveRoute ? "DEPART: dock first" : "DEPART: no route";
 }
 
 // ---- Fuel / charge gate ----------------------------------------------------
@@ -1641,10 +1722,48 @@ string PageName()
 // ============================================================================
 void RenderShip()
 {
+    // Build each distinct view's text once, then write it to every screen showing
+    // that view (sized to each screen on its own). Most rigs use only a couple of
+    // views, so this caches the work instead of rebuilding per panel.
+    var cache = new Dictionary<string, string>();
+    foreach (var t in shipScreens)
+    {
+        string text;
+        if (!cache.TryGetValue(t.View, out text))
+        {
+            text = WrapText(BuildView(t.View), WRAP_COLS);
+            cache[t.View] = text;
+        }
+        SizeAndWrite(t, text);
+    }
+    // The PB terminal always echoes the full view for troubleshooting.
+    Echo(WrapText(BuildView(VIEW_FULL), WRAP_COLS));
+}
+
+// Assemble the raw (pre-wrap) text for a named view. Views compose from the shared
+// header/menu builders so they stay in lockstep with the live state.
+string BuildView(string view)
+{
+    switch (view)
+    {
+        case VIEW_MENU:   return BuildMenu();
+        case VIEW_STATUS: return BuildStatus();
+        case VIEW_TRIP:   return BuildTrip();
+        default:          return BuildHeader() + BuildMenu();   // full
+    }
+}
+
+// Compact one-line header: ship + short state + run flag.
+string BuildHeaderLine()
+{
+    return shipName + " " + ShipState() + (operating ? " [RUN]" : " [STOP]");
+}
+
+// The full multi-line status header (name/state, cargo, route, ETA, status line).
+string BuildHeader()
+{
     var sb = new StringBuilder();
-    // Header: ship + short state + run flag on one compact line.
-    sb.Append(shipName).Append(' ').Append(ShipState())
-      .Append(operating ? " [RUN]" : " [STOP]").Append('\n');
+    sb.Append(BuildHeaderLine()).Append('\n');
     sb.Append("Cargo ").Append(CargoFillPct().ToString("0")).Append("% ")
       .Append((ShipMassKg() / 1000.0).ToString("0")).Append("t ")
       .Append((rc != null ? rc.GetShipSpeed() : 0).ToString("0")).Append("m/s\n");
@@ -1653,17 +1772,48 @@ void RenderShip()
         sb.Append("ETA ").Append(FormatEta()).Append(' ')
           .Append((RemainingDistance() / 1000.0).ToString("0.0")).Append("km\n");
     sb.Append(statusMsg).Append('\n');
+    return sb.ToString();
+}
 
-    // Interactive menu
+// The interactive menu block (page title, cursored labels, control footer).
+string BuildMenu()
+{
+    var sb = new StringBuilder();
     sb.Append("-- ").Append(PageName()).Append(" --\n");
     var labels = MenuLabels();
     for (int i = 0; i < labels.Count; i++)
         sb.Append(i == menuIndex ? "> " : "  ").Append(labels[i]).Append('\n');
     sb.Append(editing ? "UP/DN +/-  APPLY save" : "UP/DN  APPLY  BACK");
+    return sb.ToString();
+}
 
-    string text = WrapText(sb.ToString(), WRAP_COLS);
-    WriteShipScreens(text);
-    Echo(text);
+// Compact at-a-glance status: state + run flag, then cargo / mass / speed.
+string BuildStatus()
+{
+    var sb = new StringBuilder();
+    sb.Append("-- Status --\n");
+    sb.Append(ShipState()).Append(operating ? " [RUN]" : " [STOP]").Append('\n');
+    sb.Append('\n');
+    sb.Append("-- Cargo --\n");
+    sb.Append(CargoFillPct().ToString("0")).Append("%  ")
+      .Append((ShipMassKg() / 1000.0).ToString("0")).Append("t  ")
+      .Append((rc != null ? rc.GetShipSpeed() : 0).ToString("0")).Append("m/s");
+    return sb.ToString();
+}
+
+// Trip view: route, current phase, ETA/distance while cruising, and the live
+// status line (delivered / holding / fuel-hold messages surface here).
+string BuildTrip()
+{
+    var sb = new StringBuilder();
+    sb.Append("-- Trip --\n");
+    sb.Append(haveRoute ? ("Route " + path.Count + "wp") : "Route: none").Append('\n');
+    sb.Append("Phase: ").Append(ShipState()).Append('\n');
+    if (state == State.CruiseToDest || state == State.CruiseToHome)
+        sb.Append("ETA ").Append(FormatEta()).Append("  ")
+          .Append((RemainingDistance() / 1000.0).ToString("0.0")).Append("km\n");
+    sb.Append(statusMsg);
+    return sb.ToString();
 }
 
 // Short, single-word state label for the compact header.
@@ -1685,34 +1835,32 @@ string ShipState()
     }
 }
 
-// Render the same text on every ship screen at ONE shared font size. The size
-// is the largest that still fits the most-constrained tagged LCD, so all the
-// status panels read identically and nothing clips. The PB's own screen is
-// written too but never drives the size (it is tiny and only a fallback), so it
-// can't shrink the wall LCDs. Word-wrap keeps any single line inside the budget.
-void WriteShipScreens(string text)
+// Write one screen's text, sized to THAT surface only (no cross-screen coupling):
+// applies the screen's padding, then a fixed font size if it pinned one, otherwise
+// the largest font that fits this surface's own (already-wrapped) content within the
+// padded area, clamped to a sane range.
+void SizeAndWrite(ScreenTarget t, string text)
 {
-    var probe = new StringBuilder(text);
-    // Panels the operator actually reads size the font; fall back to the PB
-    // screen only when no LCDs are tagged.
-    List<IMyTextSurface> sizing = screens.Count > 0
-        ? screens
-        : new List<IMyTextSurface> { pbSurface };
-
-    float size = 0f; bool have = false;
-    foreach (var s in sizing)
+    var s = t.Surface;
+    if (s == null) return;
+    float pad = (float)Clamp(t.Pad, 0, 40);   // % per side; clamp leaves usable area
+    s.TextPadding = pad;
+    if (t.FixedSize > 0)
     {
-        if (s == null) continue;
-        var m = s.MeasureStringInPixels(probe, s.Font, 1f);
-        if (m.X < 1 || m.Y < 1) continue;
-        Vector2 area = s.SurfaceSize;
-        float fit = Math.Min(area.X / m.X, area.Y / m.Y) * 0.95f;
-        if (!have || fit < size) { size = fit; have = true; }   // most-constrained wins
+        s.FontSize = t.FixedSize;
     }
-    if (have) size = (float)Clamp(size, 0.4, 3.0);
-
-    foreach (var s in screens) { if (s == null) continue; if (have) s.FontSize = size; s.WriteText(text); }
-    if (pbSurface != null) { if (have) pbSurface.FontSize = size; pbSurface.WriteText(text); }
+    else
+    {
+        var m = s.MeasureStringInPixels(new StringBuilder(text), s.Font, 1f);
+        if (m.X >= 1 && m.Y >= 1)
+        {
+            float padScale = Math.Max(0.1f, 1f - 2f * pad / 100f);   // padding insets both sides
+            Vector2 area = s.SurfaceSize * padScale;
+            float fit = Math.Min(area.X / m.X, area.Y / m.Y) * 0.95f;
+            s.FontSize = (float)Clamp(fit, 0.4, 3.0);
+        }
+    }
+    s.WriteText(text);
 }
 
 // Word-wrap to a fixed column count. Monospace => columns == characters, so this
@@ -1870,6 +2018,30 @@ void BackfillConfig()
     Me.CustomData = ini.ToString();
 }
 
+// A base/station board only ever reads role, shipName, channel and lcdTag - the
+// flight/cargo/fuel keys are meaningless to it. Rewrite the [shuttle] section with
+// just those four so a board's Custom Data isn't cluttered with irrelevant tuning
+// (e.g. a block first compiled as a shuttle, then switched to base). Other sections
+// are left untouched. Runs on compile for the base role only.
+void TrimBaseConfig()
+{
+    var ini = new MyIni();
+    ini.TryParse(Me.CustomData);
+    ini.DeleteSection("shuttle");
+    WriteBaseSection(ini);
+    Me.CustomData = ini.ToString();
+}
+
+// Write the minimal base-role key set. Normalizes the role to "base" (so a
+// "station" alias is rewritten cleanly).
+void WriteBaseSection(MyIni ini)
+{
+    ini.Set("shuttle", "role", "base");
+    ini.Set("shuttle", "shipName", shipName);
+    ini.Set("shuttle", "channel", channel);
+    ini.Set("shuttle", "lcdTag", lcdTag);
+}
+
 // Write the full [shuttle] key set from the current field values into an ini,
 // leaving all other sections untouched. Shared by the first-run template and the
 // on-compile backfill.
@@ -1910,7 +2082,9 @@ void LoadConfig()
 {
     var ini = new MyIni();
     if (!ini.TryParse(Me.CustomData)) return;
-    role = ini.Get("shuttle", "role").ToString("shuttle").Trim().ToLower() == "base" ? Role.Base : Role.Shuttle;
+    // Role: "base" (or its alias "station") renders the board; anything else flies.
+    string roleStr = ini.Get("shuttle", "role").ToString("shuttle").Trim().ToLowerInvariant();
+    role = (roleStr == "base" || roleStr == "station") ? Role.Base : Role.Shuttle;
     shipName = ini.Get("shuttle", "shipName").ToString(shipName);
     channel = ini.Get("shuttle", "channel").ToString(channel);
     // Run mode. Legacy WAITFULL folds into Continuous + a Cargo home trigger, but

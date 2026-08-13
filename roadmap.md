@@ -4,11 +4,37 @@ Master tracking document for the SkippyShuttle Programmable Block script.
 
 ## Current status
 
-- **Version:** 0.9.0
+- **Version:** 0.12.2
 - **Phase:** 1 (Core shuttle) + LCD UI + orientation-matched docking + per-connector departure
-  triggers — delivered, pending in-world validation
+  triggers + per-screen display views (+ per-screen padding) + base-role config hygiene — delivered,
+  pending in-world validation
 - **Environment:** Space Engineers in-game Programmable Block (single-file C#, no external
   build/test tooling available)
+
+---
+
+## Size budget & the 100,000-character limit
+
+A PB script cannot exceed **100,000 source characters**, counting comments and whitespace.
+The commented source sits at ~97 KB, but that's not the real ceiling — two structural facts
+give the remaining roadmap far more runway than the raw number implies:
+
+1. **Comments don't have to ship.** ~35 KB of the file is comments and blank lines. Stripped,
+   the script that actually goes in the PB is ~62 KB, leaving **~37 KB of real headroom**. The
+   plan when the raw source nears 100 KB (or sooner, if convenient): keep the fully-commented
+   `SkippyShuttle.cs` as the source of truth and add a build step that emits a comment-stripped
+   `SkippyShuttle.min.cs` to paste into the PB. Standard SE-scripting practice. *Tradeoff:*
+   in-game compile errors then report line numbers against the minified file, not the source —
+   a minor debugging cost on a script that already compiles clean.
+2. **Station/controller work lives in a separate script.** Per Phase 2.0, the control tower is
+   its own deliverable (`SkippyTower.cs`), so Phase 2 and most of Phase 3 consume **none** of
+   the shuttle's budget. Only genuinely ship-side features (Phase 2c — multi-stop routes,
+   per-item manifests) compete for the shuttle file's space — and they do so against the
+   post-strip ~37 KB, not the pre-strip ~2.8 KB.
+
+Net: the remaining roadmap fits. The shuttle file's practical budget is the stripped size, and
+the tower's features don't touch it at all. Revisit this section if a single ship-side feature
+ever threatens the stripped ceiling.
 
 ---
 
@@ -120,6 +146,89 @@ manual `DEPART` (local + remote) and a fuel/battery gate.
 - [x] **Back-compat:** `runMode = WAITFULL` (config or `MODE`) loads as `Continuous` + `homeTrigger = Cargo`.
 - [ ] Field-confirm: each end honors its trigger; Manual holds until `DEPART` (ship + base both release);
       Timer dwells; Cargo waits full/empty; Auto unchanged; fuel gate holds then departs when met.
+
+## Phase 1.10 — per-screen display views ✅ delivered (v0.10.0)
+
+The ship display was too crowded and resized badly: `RenderShip()` wrote one combined
+header+menu blob to every screen, and a single shared font (largest that fit the *most-
+constrained* panel) dragged the big wall LCDs down to a tiny screen's size. Split the
+information across screens, each sized to its own content.
+
+- [x] Four views — `full` (default, unchanged), `menu`, `status` (compact cargo block),
+      `trip` (route/phase/ETA + transient status line). `RenderShip()` refactored into
+      composable text builders (`BuildHeader`/`BuildMenu`/`BuildView`).
+- [x] Per-screen view assignment: name tag `[SHUTTLE:view]` on standalone LCDs (bare
+      `[SHUTTLE]` = `full`, back-compat), and an opt-in `[shuttle-screens]` Custom Data
+      section (`index = view@size`) on cockpit / multi-surface providers — the 3-screen case.
+- [x] **Each screen sizes its own font independently** (`SizeAndWrite`), replacing the
+      shared most-constrained-panel font — the fix for both the shrink and the clutter.
+- [x] Optional fixed size per screen (`[SHUTTLE:status:1.4]` / `2 = status@1.4`); omit for auto-fit.
+- [ ] Field-confirm: existing `[SHUTTLE]` LCD + PB screen still show full view; cockpit
+      `0=menu / 1=trip / 2=status` splits correctly; small screen no longer shrinks the wall LCD.
+
+> Cockpit only this round. The base/station board (`RunBase()`) is unchanged; a station
+> "marquee" arrival-time view is deferred (the `trip` view is the groundwork for it).
+
+## Phase 1.11 — per-screen padding ✅ delivered (v0.11.0)
+
+Manual `TextPadding` set in the terminal both got reset on the next recompile (`PrepSurface`
+rewrites it) and broke the auto-fit (text overflowed, since the fit math didn't know about the
+inset). Made padding a first-class, persistent per-screen option that the auto-fit respects.
+
+- [x] `Pad` added to `ScreenTarget`; threaded through both `Discover()` loops, the PB fallback,
+      and `AddScreen`.
+- [x] Assignment syntax extended: name tag `[SHUTTLE:view:size:pad]` (`ParseScreenTag`) and
+      `[shuttle-screens]` value `view@font/pad` (`ParseViewSpec`); both back-compatible (omit → 0).
+- [x] `SizeAndWrite` sets `TextPadding` (clamped 0–40 %) and **subtracts padding from the usable
+      area** before auto-fitting, so padded text still fits its surface.
+- [ ] Field-confirm: a padded cockpit screen shows the inset and keeps a readable auto-fit font;
+      padding survives a recompile; unpadded screens are unchanged.
+
+## Phase 1.12 — base-role config hygiene ✅ delivered (v0.12.0)
+
+`role = station` silently fell through to the shuttle role (only the exact value `base` was
+matched), so a board set up with the natural word quietly ran as a flying shuttle. And a block
+switched from shuttle to base kept the full wall of flight/cargo keys it never reads.
+
+- [x] `station` accepted as an alias for `base` in `LoadConfig` (both select the board role).
+- [x] `TrimBaseConfig` / `WriteBaseSection`: the base role rewrites `[shuttle]` with only the four
+      keys it uses (`role`, `shipName`, `channel`, `lcdTag`) and normalizes the role to `base`.
+- [ ] Field-confirm: `role = station` renders the board; a shuttle-then-base block sheds its extra
+      keys on the next recompile.
+
+## Phase 2.0 — split the station controller into its own script (structural decision)
+
+Phase 2 turns the passive base board into an active **control tower** (pad registry, clearance
+protocol, multi-ship scheduling, per-pad UI). That is several KB of code a shuttle never
+executes, and the shuttle file has only ~2.8 KB of headroom under the **100,000-character PB
+limit**. So Phase 2 is where the single-file design ends: the controller gets its **own
+deliverable** rather than growing the shared file past the ceiling.
+
+**Two deliverables after the split:**
+
+- `SkippyShuttle.cs` — the ship (flight, cargo, docking, ship LCD views). Unchanged in spirit.
+- `SkippyTower.cs` *(new)* — the station controller. The `controller` role is its only role;
+  the per-view **station "marquee"** (the deferred item from Phase 1.10) belongs here, where
+  there's room to do it properly instead of bolting views onto `RunBase()`.
+
+**The load-bearing constraint — a shared IGC contract, not shared code.** The two scripts share
+almost no logic; what they *must* keep compatible is the wire protocol:
+
+- same IGC channel (`SkippyShuttleNet`) and the pipe-delimited report/command grammar, so an
+  existing shuttle keeps talking to a new tower and vice versa;
+- the tower is a **superset** listener + new `PAD|…` / `CLEAR|…` messages the shuttle learns to
+  answer — additive, so old shuttles degrade gracefully rather than breaking.
+
+Config idioms (`MyIni`, `[shuttle]`/`[route]` sections) stay shared by copy-paste convention,
+not by shared source.
+
+**Decision on the current base/station code (2026-08-13):** *keep it in the shuttle file for
+now.* It's small, self-contained (`RunBase()` + role parse + `TrimBaseConfig`/`WriteBaseSection`),
+working, and in active use as a fleet board — and it is **not** what threatens the char limit.
+Stripping it ahead of a tower that isn't scheduled would be a pure regression. Whether the
+lightweight board **survives as a low-effort option** in the shuttle file or is **superseded** by
+the tower is deferred to the split itself — that call needs to see how much the tower actually
+does, so it's made at Phase 2, not blind now.
 
 ## Phase 2 — Air-traffic control & connector discovery (recommended next)
 

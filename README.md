@@ -22,6 +22,8 @@ two docking points (for example, a planet base and an orbital station).
 - **Cargo-aware.** Toggles your load/unload sorters and enforces a mass gate so the ship
   never departs overweight.
 - **Live status + ETA.** Ship LCDs show state/ETA; the shuttle broadcasts to base screens.
+  Split the display across cockpit screens — menu on one, trip info on another, a compact
+  status on a third — each sized to its own content (see **Screen views** below).
 
 ---
 
@@ -36,7 +38,7 @@ two docking points (for example, a planet base and an orbital station).
 
 | Key | Default | Meaning |
 |---|---|---|
-| `role` | `shuttle` | `shuttle` (flies) or `base` (renders the board) |
+| `role` | `shuttle` | `shuttle` (flies) or `base` / `station` (renders the board) |
 | `shipName` | `Skippy` | Label shown on the base board |
 | `channel` | `SkippyShuttleNet` | IGC channel — **must match** on ship and base |
 | `runMode` | `CONTINUOUS` | Trip cycle: `CONTINUOUS`, `ONETRIP`, or `ONEWAY` (departure is a *separate* setting — see below) |
@@ -117,6 +119,57 @@ show a status header with a `>` cursor menu beneath it:
 - **Depart:** cycle **Home Trigger** / **Dest Trigger** (Auto/Cargo/Timer/Manual) and edit
   **Dwell** (Timer seconds), **Min H2 %**, **Min Batt %**, and **Fuel Margin %** in place.
 
+### Screen views (split the display across screens)
+
+By default every tagged screen shows the **full** display — the status header plus the
+interactive menu. If that's too crowded (e.g. a cockpit with several screens), you can give
+each screen a *different* view. Each screen also **sizes its font to its own content**, so a
+small screen no longer shrinks a big wall LCD.
+
+Four views:
+
+| View | Shows |
+|---|---|
+| `full` *(default)* | Status header + interactive menu (unchanged from before) |
+| `menu` | Just the interactive menu — the screen you drive from (no status header; pair it with a `status` screen) |
+| `status` | Compact block: `-- Status --` / `<State> [RUN\|STOP]` / *(blank)* / `-- Cargo --` / `<fill>%  <mass>t  <speed>m/s` |
+| `trip` | Route, current phase, ETA + distance while cruising, and the transient status line (delivered / holding at destination / holding at home / fuel-hold) |
+
+Assign a view two ways:
+
+- **Standalone LCD — name tag.** Append `:view` to the base tag in the panel's name:
+  `[SHUTTLE:trip]`, `[SHUTTLE:menu]`, `[SHUTTLE:status]`. A bare `[SHUTTLE]` stays `full`.
+- **Cockpit / multi-surface block — Custom Data.** Add an opt-in `[shuttle-screens]` section
+  to the block's Custom Data mapping each surface index to a view:
+
+  ```
+  [shuttle-screens]
+  0 = menu
+  1 = trip
+  2 = status
+  ```
+
+  Surface indices are the same ones the game numbers the block's screens with. This is the
+  3-screen-cockpit case; because it's opt-in, an unconfigured cockpit is never touched. It
+  works for the Programmable Block's own screens too.
+
+**Pin a fixed font size** on any screen if you don't want auto-fit: `[SHUTTLE:status:1.4]`
+(name tag) or `2 = status@1.4` (Custom Data). Omit the size to keep the per-screen auto-fit.
+
+**Pin the padding too** — the screen's `TextPadding` (% inset per side, clamped 0–40) as a
+persistent option the auto-fit respects, so a cramped surface can breathe and won't reset on
+the next recompile. Append it after the size: `[SHUTTLE:status:1.4:6]` (name tag,
+`:view:size:pad`) or `2 = status@1.4/6` (Custom Data, `view@font/pad`). Leave the font on
+auto-fit while still setting padding with `[SHUTTLE:status::6]` or `2 = status@/6`. The
+auto-fit subtracts the padding from the usable area, so padded text still fits.
+
+> **Recompile after editing `[shuttle-screens]`.** Screen assignments (and the base tag on
+> LCD names) are read when the script discovers blocks, which happens on recompile. Change
+> the section, then recompile the PB to see the new layout.
+
+> Cockpit/ship screens only. The base/station board still shows its shuttle list; per-view
+> station "marquees" are on the roadmap.
+
 ### Run modes vs. departure triggers
 
 The **run mode** decides the *trip cycle*; the **departure trigger** decides *when each leg
@@ -163,6 +216,12 @@ skips the hydrogen check; one with no batteries skips the charge check.
 Set a base PB to `role = base` and the same `channel`. Tag base LCDs with `[SHUTTLE]`
 (or your `lcdTag`). The board shows each shuttle's state, ETA, distance, cargo % and mass,
 and flags **NO SIGNAL** if a shuttle drops off the network (e.g. beyond antenna range).
+
+> `role = station` works too — it's an alias for `base`. Any other value (or a blank
+> role) runs the block as a **shuttle**, so if your board isn't showing the fleet, check
+> the role is exactly `base` or `station`. A board reads only `role`, `shipName`,
+> `channel`, and `lcdTag`; on compile it trims the other (flight/cargo) keys out of its
+> Custom Data, so a block you switched from shuttle to base cleans itself up.
 
 The base PB also accepts a `DEPART` run-argument: `DEPART` releases every shuttle on the channel
 that's holding at a dock, and `DEPART <shipName>` targets just one. So a station can send a

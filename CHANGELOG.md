@@ -4,6 +4,110 @@ All notable changes to SkippyShuttle are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.12.2] - 2026-08-13
+
+### Changed
+- **`menu` view drops its status header.** The `menu` view now renders only the
+  interactive menu — the one-line `name state [RUN/STOP]` header is gone, since it
+  duplicates the `status` view on a multi-screen cockpit. Pair a `menu` screen with a
+  `status` screen for the full picture. The `full` view is unchanged (still header +
+  menu).
+
+## [0.12.1] - 2026-08-13
+
+### Changed
+- **`status` view layout.** The compact status screen now leads with a `-- Status --`
+  header (matching the `-- Cargo --` block) and puts the state on its own line, with a
+  blank line separating the two blocks — instead of the single inline `Status: <State>`
+  row. Same data, cleaner two-block layout.
+
+## [0.12.0] - 2026-08-13
+
+### Added
+- **`station` is now accepted as an alias for `role = base`.** Setting `role = station`
+  used to fall through silently to `shuttle` (the block quietly ran as a flying shuttle
+  instead of a board), because only the exact value `base` was recognized. Both `base`
+  and `station` now select the board role.
+
+### Changed
+- **A base/station board writes a trimmed config.** On compile, the board role now
+  keeps only the four keys it actually reads — `role`, `shipName`, `channel`, `lcdTag`
+  — and drops the flight/cargo/fuel tuning keys, which a board ignores. A block first
+  compiled as a shuttle and then switched to base no longer carries a wall of
+  irrelevant settings in its Custom Data. Shuttle-role config is unchanged.
+
+## [0.11.0] - 2026-08-13
+
+### Added
+- **Per-screen padding — a first-class, persistent option the auto-fit respects.** You
+  can now pin the `TextPadding` (% inset per side) on any ship screen alongside its view
+  and font, so a cramped cockpit surface can breathe without being reset on the next
+  recompile. Two syntaxes, matching the existing view/size assignment:
+  - **Name tag:** `[SHUTTLE:status:1.4:6]` — `:view:size:pad`. Pin only the pad while
+    keeping auto-fit font with `[SHUTTLE:status::6]`.
+  - **`[shuttle-screens]` Custom Data:** `2 = status@1.4/6` — `view@font/pad`. Use
+    `status@/6` to set padding but leave the font on auto-fit.
+  Padding is clamped 0–40 %. Omit it (as every pre-0.11.0 config does) and screens keep
+  zero padding, exactly as before.
+
+### Changed
+- **The per-screen font auto-fit now subtracts padding from the usable area** before
+  choosing a size, so padded screens still fit their content instead of overflowing. A
+  screen with no padding is unaffected.
+
+## [0.10.0] - 2026-08-13
+
+### Added
+- **Per-screen display views — split the crowded ship display across multiple screens.**
+  Each screen can now show a *different* slice of the status instead of every screen
+  carrying the whole header+menu. Four views:
+  - **full** *(default)* — today's combined status header + interactive menu. Any screen
+    not explicitly assigned stays exactly as it was, so nothing changes on upgrade.
+  - **menu** — a one-line header (`name state [RUN/STOP]`) plus the interactive menu.
+    Good for the cockpit screen you drive from.
+  - **status** — a compact block: `Status: <State> [RUN|STOP]` / `-- Cargo --` /
+    `<fill>%  <mass>t  <speed>m/s`. Fits a small screen without shrinking.
+  - **trip** — route, current phase, ETA + distance while cruising, and the transient
+    status line (delivered / holding at destination / holding at home / fuel-hold).
+- **Two ways to assign a view to a screen:**
+  - **Name tag** on a standalone LCD: `[SHUTTLE:trip]`, `[SHUTTLE:menu]`, etc. — an
+    optional `:view` (and `:size`) after the base tag. A bare `[SHUTTLE]` is still `full`.
+  - **`[shuttle-screens]` Custom Data section** on a cockpit / multi-surface block
+    (opt-in), mapping each surface index to a view:
+    ```
+    [shuttle-screens]
+    0 = menu
+    1 = trip
+    2 = status@1.4
+    ```
+    This is the 3-screen-cockpit case; being opt-in it never touches an unconfigured block.
+- **Optional fixed font size per screen** — pin a size with `[SHUTTLE:status:1.4]` (name
+  tag) or `2 = status@1.4` (Custom Data). Omit it to keep auto-fit.
+
+### Changed
+- **Each screen now sizes its font to its own content**, independently. The previous
+  render applied a single shared font — the largest that fit the *most-constrained* panel —
+  to every screen, so one small surface (e.g. a cockpit screen) shrank the big wall LCDs and
+  every screen was forced to carry the full header+menu. That shared-font coupling is gone;
+  a small `status` screen and a wide `full` LCD each pick their own best size.
+- Condensed the top-of-file documentation comment to keep the script under Space
+  Engineers' **100,000-character Programmable Block limit** (the view feature pushed it
+  just over). The full key table and semantics live in [README.md](README.md); the
+  in-script header is now a concise pointer to it. No code or behaviour change.
+
+## [0.9.1] - 2026-08-13
+
+### Fixed
+- **"Depart Now" did nothing when the shuttle was parked idle at a dock** — it
+  replied "not holding at a dock" even though it plainly was. The manual `DEPART`
+  (ship button, run-arg, or station broadcast) only accepted the request while the
+  ship was already mid-cycle in `Loading`/`Unloading`. Now, when it's Idle and
+  docked with a route, Depart Now begins operating and dispatches the next leg
+  immediately — the same direction `START` would pick (by which end it's physically
+  parked at), with the manual override latched so it leaves without waiting on the
+  end's trigger (the fuel/battery gate still applies). The rejection messages are
+  also clearer: "already under way" while flying, "dock first" / "no route" otherwise.
+
 ## [0.9.0] - 2026-08-13
 
 ### Added
