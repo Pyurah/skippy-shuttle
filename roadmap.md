@@ -4,7 +4,7 @@ Master tracking document for the SkippyShuttle Programmable Block script.
 
 ## Current status
 
-- **Version:** 0.12.2
+- **Version:** 0.13.1
 - **Phase:** 1 (Core shuttle) + LCD UI + orientation-matched docking + per-connector departure
   triggers + per-screen display views (+ per-screen padding) + base-role config hygiene — delivered,
   pending in-world validation
@@ -20,12 +20,13 @@ The commented source sits at ~97 KB, but that's not the real ceiling — two str
 give the remaining roadmap far more runway than the raw number implies:
 
 1. **Comments don't have to ship.** ~35 KB of the file is comments and blank lines. Stripped,
-   the script that actually goes in the PB is ~62 KB, leaving **~37 KB of real headroom**. The
-   plan when the raw source nears 100 KB (or sooner, if convenient): keep the fully-commented
-   `SkippyShuttle.cs` as the source of truth and add a build step that emits a comment-stripped
-   `SkippyShuttle.min.cs` to paste into the PB. Standard SE-scripting practice. *Tradeoff:*
-   in-game compile errors then report line numbers against the minified file, not the source —
-   a minor debugging cost on a script that already compiles clean.
+   the script that actually goes in the PB is ~63.6 KB, leaving **~36 KB of real headroom**.
+   **Delivered (v0.13.1):** `tools/build-min.py` emits a comment-stripped `SkippyShuttle.min.cs`
+   to paste into the PB, while `SkippyShuttle.cs` stays the fully-commented source of truth.
+   Character-state aware (never strips a `//`/`/*` inside a literal); checks brace balance and
+   the 100,000-char limit. *Tradeoff:* in-game compile errors then report line numbers against
+   the minified file, not the source — a minor debugging cost on a script that already compiles
+   clean.
 2. **Station/controller work lives in a separate script.** Per Phase 2.0, the control tower is
    its own deliverable (`SkippyTower.cs`), so Phase 2 and most of Phase 3 consume **none** of
    the shuttle's budget. Only genuinely ship-side features (Phase 2c — multi-stop routes,
@@ -265,6 +266,12 @@ Delivered into the core (was conditional). Docking is no longer nose-first-only.
 - [x] Low-battery / low-hydrogen guard: refuse departure until the level covers the next leg
       (adaptive per-direction estimate + hard floors, delivered v0.9.0). *Divert-home-if-stranded
       is not implemented — the shuttle holds at the dock rather than launching under-fuelled.*
+- [x] **Collinear route simplification (v0.13.0)** — the recorder slides straight-run
+      breadcrumbs forward instead of appending, so a straight leg collapses to its two
+      endpoints and the `MAX_PATH` = 250 budget is spent on turns. New `simplifyMeters` key
+      (default 15 m; 0 = off). Fixes the 78 km run overflowing the waypoint cap. *Field-confirm:
+      re-record HOME→DEST and check the straight cruise uses only a handful of waypoints while
+      the dock approaches keep full detail.*
 - [ ] Multi-stop routes (more than two connectors).
 - [ ] Per-item load manifests (fill specific items to target amounts).
 

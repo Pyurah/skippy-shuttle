@@ -34,6 +34,12 @@ two docking points (for example, a planet base and an orbital station).
 2. Edit the Custom Data (see below), then recompile again.
 3. Repeat for the base/station PB, but set `role = base`.
 
+> **Near the 100,000-char PB limit?** The commented source is close to the cap. Run
+> `python tools/build-min.py` to generate `SkippyShuttle.min.cs` — the same code with
+> comments and blank lines stripped (~36 % smaller) — and paste *that* into the PB instead.
+> Keep editing `SkippyShuttle.cs`; the min file is a generated artifact. (Note: in-game
+> compile errors then report line numbers against the min file, not the source.)
+
 ## Custom Data (`[shuttle]` section)
 
 | Key | Default | Meaning |
@@ -59,6 +65,7 @@ two docking points (for example, a planet base and an orbital station).
 | `unloadDrainSec` | `30` | Max seconds spent unloading before leaving |
 | `segMeters` | `250` | Breadcrumb spacing on straight runs |
 | `turnDegrees` | `12` | Extra breadcrumb when heading turns this much |
+| `simplifyMeters` | `15` | How far the recorded path may bow from a straight chord before a waypoint is kept. Straight runs collapse to their endpoints, so the 250-waypoint budget goes to turns. `0` = off (dense recording) |
 | `approachDist` | `15` | On-axis stand-off (m) where cruise hands off to the docking controller |
 | `gyroRpmCap` | `0` | Gyro rate cap (RPM) for gentle rotation. `0` = auto (15 small grid / 5 large) |
 | `brakeFrac` | `0.6` | Fraction of the weakest thrust axis used for braking/cornering (headroom for gravity + saturation). Lower = brakes earlier/gentler. Clamped 0.1–1.0 |
@@ -85,6 +92,14 @@ settings are left untouched.
 2. Run `RECORD HOME`. Fly straight out ~50 m, then continue to the destination by hand.
 3. Manually dock at the **destination** connector.
 4. Run `RECORD DEST`. The route is saved.
+
+The recorder is **self-thinning**: it drops a breadcrumb every `segMeters` and at every
+heading change of `turnDegrees`, but then collapses breadcrumbs that lie on a straight line
+back onto a single segment (within `simplifyMeters` of the chord). So a long straight cruise
+costs ~2 waypoints while a twisty approach keeps full detail — the 250-waypoint cap is spent
+where precision matters. If a route ever reports **"Path full"**, raise `segMeters` (coarser
+sampling) or `simplifyMeters` (more aggressive straightening) and re-record. Set
+`simplifyMeters = 0` to disable straightening and record densely.
 
 ## Commands (run-argument on the ship PB)
 

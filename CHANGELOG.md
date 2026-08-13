@@ -4,6 +4,39 @@ All notable changes to SkippyShuttle are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.13.1] - 2026-08-13
+
+### Added
+- **`tools/build-min.py` deploy build.** Emits a comment-stripped `SkippyShuttle.min.cs`
+  (~63.6 KB, ~36 % smaller) to paste into the Programmable Block, while `SkippyShuttle.cs`
+  stays the fully-commented source of truth. Character-state aware (never strips a `//` or
+  `/*` inside a string/char literal); verifies brace balance and the 100,000-char limit.
+
+### Fixed
+- **An idle PB no longer fights your dampener switch.** While parked in `Idle` (or
+  `Faulted`), the ship loop called `ReleaseControl()` every tick, which re-asserted
+  dampeners **on** ~6×/second — so a pilot hand-flying with the PB still running couldn't
+  keep dampeners off. The controller now tracks whether *it* turned dampeners off and only
+  restores those, so a parked/idle shuttle leaves your manual switch alone. A ship that just
+  finished a flight still gets dampeners restored once (it can't drift), and a mid-flight
+  recompile still does its one-time safety restore.
+
+## [0.13.0] - 2026-08-13
+
+### Added
+- **Collinear route simplification.** The recorder now slides a straight-run breadcrumb
+  *forward* onto the current segment instead of appending a new one, so a dead-straight leg
+  collapses to just its two endpoints. Corners still keep their vertices (the tip lands well
+  off the new chord, so it's preserved), so the `MAX_PATH` = 250 waypoint budget is spent on
+  turns, not on spacing down a straight. New `simplifyMeters` key (default `15`) sets how far
+  the path may bow from a straight chord before a waypoint is kept; `0` restores the old dense
+  every-`segMeters` recording. This is the fix for the 78 km run overflowing the 250-waypoint
+  cap — re-record the route to benefit.
+
+### Changed
+- The "path full" status message now reads `raise segMeters/simplifyMeters` (both levers now
+  reduce waypoint count).
+
 ## [0.12.2] - 2026-08-13
 
 ### Changed
