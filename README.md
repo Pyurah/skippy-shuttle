@@ -39,7 +39,7 @@ two docking points (for example, a planet base and an orbital station).
 | `role` | `shuttle` | `shuttle` (flies) or `base` (renders the board) |
 | `shipName` | `Skippy` | Label shown on the base board |
 | `channel` | `SkippyShuttleNet` | IGC channel — **must match** on ship and base |
-| `runMode` | `CONTINUOUS` | `CONTINUOUS`, `ONETRIP`, or `WAITFULL` |
+| `runMode` | `CONTINUOUS` | `CONTINUOUS`, `ONETRIP`, `WAITFULL`, or `ONEWAY` |
 | `remoteName` | *(blank)* | Blank = auto-find a Remote Control on the grid |
 | `loadTag` | `[SHUTTLE:LOAD]` | Sorters whose name **contains** this tag load cargo at home |
 | `unloadTag` | `[SHUTTLE:UNLOAD]` | Sorters whose name **contains** this tag unload at the destination |
@@ -87,7 +87,7 @@ settings are left untouched.
 | `START` / `GO` | Begin operating per the run mode |
 | `STOP` | Abort the flight, turn sorters off, return to Idle |
 | `HOME` | Fly back to the home connector and dock |
-| `MODE CONTINUOUS\|ONETRIP\|WAITFULL` | Change the run mode live |
+| `MODE CONTINUOUS\|ONETRIP\|WAITFULL\|ONEWAY` | Change the run mode live |
 | `RESUME` | Continue the saved state after a recompile |
 | `CLEARROUTE` | Erase the recorded route |
 | `UP` / `DOWN` | Move the LCD menu cursor (or change a value while editing) |
@@ -112,6 +112,12 @@ show a status header with a `>` cursor menu beneath it:
 - **CONTINUOUS** — loops forever: load → fly → unload → return → repeat, until `STOP`.
 - **ONETRIP** — one round trip on `START`/`GO`, then waits.
 - **WAITFULL** — like continuous, but only departs once cargo reaches `departFill`%.
+- **ONEWAY** — one leg per `START`, then **holds at the far end** instead of returning.
+  Docked at home, it loads, flies to the station, unloads, and waits there. The next
+  `START` flies it straight back home and waits again. It decides which way to go from
+  **which connector it's docked at**, so it always knows whether it's sitting at home
+  or at the station — you never have to tell it. Good for "take this load over and stay
+  put until I send you back."
 
 ## Base board
 

@@ -30,7 +30,7 @@
  *   START / GO    Begin operating (loads, flies, unloads per the run mode).
  *   STOP          Abort autopilot and return to Idle (stays docked/where it is).
  *   HOME          Fly back to the home connector and dock.
- *   MODE CONTINUOUS | ONETRIP | WAITFULL   Change the run mode live.
+ *   MODE CONTINUOUS | ONETRIP | WAITFULL | ONEWAY   Change the run mode live.
  *   RESUME        Continue the saved state after a recompile.
  *   CLEARROUTE    Erase the recorded route.
  *   UP / DOWN     Move the LCD menu cursor (bind to cockpit toolbar buttons).
@@ -42,7 +42,7 @@
  *   role         = shuttle            ; shuttle | base
  *   shipName     = Skippy             ; label shown on base screens
  *   channel      = SkippyShuttleNet   ; IGC broadcast channel (must match base)
- *   runMode      = CONTINUOUS         ; CONTINUOUS | ONETRIP | WAITFULL
+ *   runMode      = CONTINUOUS         ; CONTINUOUS | ONETRIP | WAITFULL | ONEWAY
  *   remoteName   =                    ; blank = auto-find a Remote Control
  *   loadTag      = [SHUTTLE:LOAD]      ; sorters with this tag in their name load cargo
  *   unloadTag    = [SHUTTLE:UNLOAD]    ; sorters with this tag in their name unload cargo
@@ -87,11 +87,14 @@
  * Version tracked in CHANGELOG.md. Semver.
  *//////////////////////////////////////////////////////////////////////////////
 
-const string VERSION = "0.7.0";
+const string VERSION = "0.8.0";
 
 // ---- Roles / states --------------------------------------------------------
 enum Role { Shuttle, Base }
-enum RunMode { Continuous, OneTrip, WaitFull }
+// Continuous/OneTrip/WaitFull do a full round trip (home -> dest -> home). OneWay
+// runs a single leg to the OPPOSITE end and holds there; the next START sends it
+// back. Which way OneWay goes is decided by which connector it's docked at.
+enum RunMode { Continuous, OneTrip, WaitFull, OneWay }
 
 // A full docked pose: where the Remote Control sat, which way the ship faced,
 // and the bound connector's mating axis. Capturing all four lets the shuttle
@@ -346,11 +349,21 @@ void HandleCommand(string arg)
         case "GO":
             if (!haveRoute) { statusMsg = "No route - RECORD HOME/DEST first"; break; }
             operating = true;
-            // Kick off from wherever we sensibly can.
+            // Kick off from wherever we sensibly can. ONEWAY runs a single leg to the
+            // OPPOSITE end and holds there, so its direction is decided purely by which
+            // connector we're docked at: at dest -> depart straight for home (no re-unload);
+            // at home -> load and head to dest. The other modes cycle a full round trip.
             if (state == State.Idle || state == State.Faulted)
-                state = IsDockedAt(homeConn) ? State.Loading
-                      : IsDockedAt(destConn) ? State.Unloading
-                      : State.CruiseToHome;
+            {
+                if (runMode == RunMode.OneWay)
+                    state = IsDockedAt(destConn) ? State.UndockDest
+                          : IsDockedAt(homeConn) ? State.Loading
+                          : State.CruiseToDest;
+                else
+                    state = IsDockedAt(homeConn) ? State.Loading
+                          : IsDockedAt(destConn) ? State.Unloading
+                          : State.CruiseToHome;
+            }
             statusMsg = "Started (" + runMode + ")";
             break;
 
@@ -405,7 +418,8 @@ void SetMode(string m)
         case "CONTINUOUS": runMode = RunMode.Continuous; break;
         case "ONETRIP":    runMode = RunMode.OneTrip;    break;
         case "WAITFULL":   runMode = RunMode.WaitFull;   break;
-        default: statusMsg = "Mode must be CONTINUOUS|ONETRIP|WAITFULL"; return;
+        case "ONEWAY":     runMode = RunMode.OneWay;     break;
+        default: statusMsg = "Mode must be CONTINUOUS|ONETRIP|WAITFULL|ONEWAY"; return;
     }
     var ini = new MyIni(); ini.TryParse(Me.CustomData);
     ini.Set("shuttle", "runMode", m);
@@ -527,7 +541,14 @@ void TickUnloading()
     {
         SetSorters(unloadSorters, false);
         phaseTimer = 0;
-        state = State.UndockDest;   // return leg; OneTrip stops after docking home
+        if (runMode == RunMode.OneWay)   // delivered - hold at the destination, don't auto-return
+        {
+            operating = false;
+            state = State.Idle;
+            statusMsg = "Delivered - holding at " + destConn;
+        }
+        else
+            state = State.UndockDest;   // return leg; OneTrip stops after docking home
     }
 }
 
@@ -1000,8 +1021,10 @@ void OnDocked(bool atDest)
     }
     else
     {
-        // Home again. OneTrip stops here; the others load and go again.
+        // Home again. OneTrip and OneWay stop and hold here; the cycling modes
+        // (Continuous/WaitFull) load and set out again.
         if (runMode == RunMode.OneTrip) { operating = false; state = State.Idle; statusMsg = "Trip complete"; }
+        else if (runMode == RunMode.OneWay) { operating = false; state = State.Idle; statusMsg = "Holding at " + homeConn; }
         else { state = State.Loading; phaseTimer = 0; }
     }
 }
@@ -1207,8 +1230,11 @@ void CycleMode()
 {
     runMode = runMode == RunMode.Continuous ? RunMode.OneTrip
             : runMode == RunMode.OneTrip ? RunMode.WaitFull
+            : runMode == RunMode.WaitFull ? RunMode.OneWay
             : RunMode.Continuous;
-    string s = runMode == RunMode.OneTrip ? "ONETRIP" : runMode == RunMode.WaitFull ? "WAITFULL" : "CONTINUOUS";
+    string s = runMode == RunMode.OneTrip ? "ONETRIP"
+             : runMode == RunMode.WaitFull ? "WAITFULL"
+             : runMode == RunMode.OneWay ? "ONEWAY" : "CONTINUOUS";
     SaveCfg("runMode", s);
     statusMsg = "Mode = " + runMode;
 }
@@ -1535,7 +1561,8 @@ void BackfillConfig()
 void WriteShuttleSection(MyIni ini)
 {
     string modeStr = runMode == RunMode.OneTrip ? "ONETRIP"
-                   : runMode == RunMode.WaitFull ? "WAITFULL" : "CONTINUOUS";
+                   : runMode == RunMode.WaitFull ? "WAITFULL"
+                   : runMode == RunMode.OneWay ? "ONEWAY" : "CONTINUOUS";
     ini.Set("shuttle", "role", role == Role.Base ? "base" : "shuttle");
     ini.Set("shuttle", "shipName", shipName);
     ini.Set("shuttle", "channel", channel);
@@ -1594,6 +1621,7 @@ void SetModeSilent(string m)
     {
         case "ONETRIP":  runMode = RunMode.OneTrip; break;
         case "WAITFULL": runMode = RunMode.WaitFull; break;
+        case "ONEWAY":   runMode = RunMode.OneWay; break;
         default:         runMode = RunMode.Continuous; break;
     }
 }

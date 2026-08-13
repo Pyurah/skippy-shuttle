@@ -4,7 +4,7 @@ Master tracking document for the SkippyShuttle Programmable Block script.
 
 ## Current status
 
-- **Version:** 0.7.0
+- **Version:** 0.8.0
 - **Phase:** 1 (Core shuttle) + LCD UI + orientation-matched docking — delivered, pending
   in-world validation
 - **Environment:** Space Engineers in-game Programmable Block (single-file C#, no external
@@ -26,7 +26,7 @@ Master tracking document for the SkippyShuttle Programmable Block script.
 | Connector auto-connect / disconnect | ✅ | Connectable → `Connect()`; timeout → Faulted |
 | Load/unload sorter control | ✅ | Toggles Enabled only; filters left untouched |
 | Mass gate + fill-based departure | ✅ | `maxMassKg`, `departFill` |
-| Three run modes (Continuous / OneTrip / WaitFull) | ✅ | Config key + `MODE` command |
+| Four run modes (Continuous / OneTrip / WaitFull / OneWay) | ✅ | Config key + `MODE` command; OneWay added v0.8.0 |
 | Ship LCD status + ETA | ✅ | ETA from remaining waypoint distance / speed |
 | IGC broadcast + base board with NO-SIGNAL handling | ✅ | Pipe-delimited report, 20 s stale timeout |
 
@@ -84,6 +84,20 @@ value could settle it.
       dampeners (off flying, restored on stop/dock/fault/recompile). Gravity legs keep hover thrust.
 - [x] Retuned defaults: `gyroDamp` 4→3, `gyroGain` field aligned to 4.
 - [ ] Field-confirm on the Earth→station run: steady heading on a straight, and **fuel flat while coasting**.
+
+## Phase 1.8 — one-way ferry mode ✅ delivered (v0.8.0)
+
+Added `ONEWAY` for "take this over and stay put." Runs a single leg to the opposite
+end and holds there; the next `START` sends it back. Direction is derived from the
+docked connector (live), so it always knows which end it's sitting at across restarts.
+
+- [x] `OneWay` added to `RunMode` (enum, `MODE` command, config load/save, LCD cycle).
+- [x] `START` dispatch is direction-aware in OneWay: at dest → depart home (no re-unload);
+      at home → load + fly to dest; mid-route → continue outbound.
+- [x] Holds (stops, `operating=false`) after delivering at the station **and** after
+      arriving home, instead of auto-cycling.
+- [ ] Field-confirm: dispatch home→station holds at the station; a second `START` returns
+      home and holds; mode survives a recompile mid-hold.
 
 ## Phase 2 — Air-traffic control & connector discovery (recommended next)
 

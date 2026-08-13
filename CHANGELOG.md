@@ -4,6 +4,20 @@ All notable changes to SkippyShuttle are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.0] - 2026-08-13
+
+### Added
+- **`ONEWAY` run mode.** Sends the shuttle a single leg to the *opposite* end and
+  holds it there instead of automatically returning. Each `START` dispatches one
+  hop: docked at home it loads and flies to the station, delivers, and waits;
+  docked at the station it flies straight home and waits. The direction is decided
+  by **which connector the ship is docked at**, read live, so it always knows which
+  end it's parked on — a `START` at the station goes home (no re-unload), a `START`
+  at home goes to the station. Survives a recompile: the connector status is the
+  source of truth, and a mid-flight leg is restored from saved state as before.
+  Selectable via `runMode = ONEWAY`, the `MODE ONEWAY` command, or the LCD menu's
+  Run Mode cycle (Continuous → OneTrip → WaitFull → OneWay).
+
 ## [0.7.0] - 2026-08-13
 
 ### Fixed
