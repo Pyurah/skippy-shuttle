@@ -4,7 +4,7 @@ Master tracking document for the SkippyShuttle Programmable Block script.
 
 ## Current status
 
-- **Version:** 0.13.6
+- **Version:** 0.14.0
 - **Phase:** 1 (Core shuttle) + LCD UI + orientation-matched docking + per-connector departure
   triggers + per-screen display views (+ per-screen padding) + base-role config hygiene — delivered,
   pending in-world validation
@@ -313,6 +313,16 @@ Delivered into the core (was conditional). Docking is no longer nose-first-only.
       left uncorrected (hover always kept), so the ship rides through the noise; path position
       still self-corrects via the target-pointing desired velocity. *Field-confirm: steady
       vertical hold during high-altitude cruise.*
+- [x] **Efficient climb attitude (v0.14.0)** — climbing to space the ship nosed up the path,
+      rotating a lift-heavy hull's strong down-thrusters sideways so the climb ran on the weak
+      rear bank. The gravity-leg attitude is now chosen per hull: **level** (belly-down VTOL
+      climb, nose yawed to the path's horizontal bearing — the strong down-thrusters lift and
+      brake the descent) vs **nose** (nose along the path, for forward-thrust-heavy hulls).
+      `cruiseAttitude` in Custom Data forces `level`/`nose`; default `auto` compares the hull's
+      up-thrust vs forward-thrust (with hysteresis) and picks. Space is always nose-forward. The
+      heading throttle now reads the nose target, not the raw path, so a deliberate off-path nose
+      in level flight doesn't retrigger the ~30 m/s alignment crawl. *Field-confirm awaited: full
+      climb speed with the lift bank carrying the climb.*
 - [ ] Multi-stop routes (more than two connectors).
 - [ ] Per-item load manifests (fill specific items to target amounts).
 

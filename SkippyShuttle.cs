@@ -34,12 +34,15 @@
  * for a connector facing any direction on any ship with gyros + thrusters. One custom
  * gyro+thruster controller flies the whole route on a velocity profile (no stock
  * autopilot weaving); at 60 Hz while flying it holds heading, turns DAMPENERS OFF and
- * coasts thrust-free in space (restored on stop/dock/fault/recompile). Sorters are
+ * coasts thrust-free in space (restored on stop/dock/fault/recompile). In gravity it
+ * flies level (belly-down VTOL climb) when the hull is lift-heavy so the strong down-
+ * thrusters do the climbing, else nose-to-path; forced with cruiseAttitude in Custom
+ * Data (auto|level|nose). Sorters are
  * only toggled on/off (filters/Drain-All untouched); tag match is case-insensitive
  * anywhere in the name. Version tracked in CHANGELOG.md. Semver.
  *//////////////////////////////////////////////////////////////////////////////
 
-const string VERSION = "0.13.6";
+const string VERSION = "0.14.0";
 
 // ---- Roles / states --------------------------------------------------------
 enum Role { Shuttle, Base }
@@ -117,6 +120,7 @@ double brakeFrac = 0.6;           // fraction of the weakest-axis thrust reserve
 double cornerLen = 30;            // [m] corner-rounding length; also the look-ahead blend distance
 double gyroGain = 4.0;            // attitude controller P gain (rotate toward the target attitude)
 double gyroDamp = 3.0;            // attitude controller damping on angular velocity; raise if the ship wobbles/overshoots/jiggles
+string cruiseAttitude = "auto";   // gravity-leg attitude: "auto" (level if lift-heavy, else nose), "level" (VTOL climb, belly down), "nose" (nose along path)
 
 // ---- Route data ------------------------------------------------------------
 // A route is two docked poses (home + dest) plus the breadcrumb path between
@@ -154,6 +158,7 @@ int cruiseIdx = 0;                              // index of the waypoint current
 double cruiseAccel = 1.0;                       // [m/s^2] decel/lateral accel cached for this leg (mass-dependent)
 double cruiseProgTimer = 0;                     // seconds since the ship last closed on its target waypoint (stuck watchdog)
 double cruiseBestDist = double.MaxValue;        // closest approach so far to the current waypoint; getting nearer resets the watchdog. A simplified straight is one waypoint tens of km away, so timing waypoint *arrivals* false-faults on a leg the ship is flying perfectly (v0.13.2)
+bool cruiseFlyLevel = false;                    // latched decision (with hysteresis) for auto cruiseAttitude: true = fly belly-down/VTOL, false = nose-to-path. See UseLevelFlight
 
 // ---- Display views (ship role) ---------------------------------------------
 // Each ship screen shows ONE view, so a 3-screen cockpit can split the display
@@ -930,35 +935,48 @@ bool RunCruiseControl()
     double vBrake = Math.Sqrt(vmax * vmax + 2.0 * cruiseAccel * dist);
     double speed = Math.Min(cruiseSpeed, vBrake);
 
-    // Attitude: face travel; hold the belly toward the planet. Crucially, use the
-    // component of anti-gravity that is PERPENDICULAR to the flight direction
-    // (Gram-Schmidt), not raw -gravity. Forward=pathDir and Up=-gravity can both be
-    // satisfied only when they're orthogonal; on a climbing or descending leg they
-    // aren't, so a rigid up = -gravity forces the gyro into a compromise that leaves a
-    // large steady heading error (~45 deg was measured on the base->station climb).
-    // The alignFac throttle then reads that as "badly aimed" and pins cruise at ~30 m/s
-    // for the whole gravity leg, even though the ship is tracking the path perfectly.
-    // Orthogonalising up against pathDir lets the gyro hit the heading exactly while
-    // keeping the belly as down as the path allows. In space (no gravity) just hold the
-    // current up so we don't roll.
-    Vector3D upTarget;
-    if (grav.LengthSquared() > 1e-3)
+    // Attitude target. fwdTarget is what the *nose* aims at (and what the heading throttle
+    // is measured against); upTarget is where the top of the ship points. In space we just
+    // nose along the path. In gravity we choose between two strategies (see UseLevelFlight):
+    //   nose  - nose along the path, belly to the planet. Uses the component of anti-gravity
+    //           PERPENDICULAR to the path (Gram-Schmidt): Forward=pathDir and Up=-gravity are
+    //           only jointly satisfiable when orthogonal, so on a climbing/descending leg a
+    //           rigid up=-gravity left a standing ~45 deg heading error that pinned cruise at
+    //           ~30 m/s. Orthogonalising lets the gyro hit the heading exactly. Best for
+    //           rocket-style hulls whose strongest thrust pushes the ship forward.
+    //   level - hold the belly straight down (lift bank pointing at the planet) and yaw the
+    //           nose to the *horizontal* bearing of the path: a VTOL climb/descent. Best for
+    //           lift-heavy hulls - the strong down-thrusters then do the climbing and the
+    //           descent-braking instead of the weak rear bank. Nothing in the force law
+    //           changes: ApplyForce still drives desiredVel = pathDir*speed, just spreading
+    //           the vertical part onto the lift thrusters this attitude puts under gravity.
+    // In space (no gravity) hold the current up so we don't roll.
+    Vector3D fwdTarget, upTarget;
+    bool inGrav = grav.LengthSquared() > 1e-3;
+    if (inGrav && UseLevelFlight())
+    {
+        Vector3D upWorld = Vector3D.Normalize(-grav);
+        Vector3D horiz = pathDir - pathDir.Dot(upWorld) * upWorld;   // path with the vertical part removed
+        fwdTarget = horiz.LengthSquared() > 1e-6 ? Vector3D.Normalize(horiz) : rc.WorldMatrix.Forward;
+        upTarget = upWorld;
+    }
+    else if (inGrav)
     {
         Vector3D up = -grav;
         Vector3D perp = up - up.Dot(pathDir) * pathDir;
+        fwdTarget = pathDir;
         upTarget = perp.LengthSquared() > 1e-6 ? Vector3D.Normalize(perp) : rc.WorldMatrix.Up;
     }
-    else upTarget = rc.WorldMatrix.Up;
-    double align = AlignTo(pathDir, upTarget);
+    else { fwdTarget = pathDir; upTarget = rc.WorldMatrix.Up; }
+    double align = AlignTo(fwdTarget, upTarget);
 
-    // Turn before accelerating; don't fly fast sideways. Both factors are floored
-    // so the ship can still creep and re-align rather than dead-stall. The heading
-    // throttle uses *forward* error only (Forward x pathDir): being rolled off level
-    // - e.g. while re-leveling to gravity's up as it crosses into the planet well -
-    // doesn't affect forward translation, so it must not cut cruise speed. Using the
-    // combined attitude error here made the ship crawl (~30 m/s) through the whole
-    // space->gravity transition while it slowly rolled level.
-    double headErr = rc.WorldMatrix.Forward.Cross(pathDir).Length();
+    // Turn before accelerating; don't fly fast sideways. Both factors are floored so the
+    // ship can still creep and re-align rather than dead-stall. The heading throttle reads
+    // the *nose target* (Forward x fwdTarget), not the raw path: being rolled off level, or
+    // (in level flight) deliberately not pointing up a steep climb, doesn't affect the
+    // thrust that actually moves the ship, so it must not cut cruise speed. Throttling on
+    // the vertical miss is exactly the old ~30 m/s trap.
+    double headErr = rc.WorldMatrix.Forward.Cross(fwdTarget).Length();
     double alignFac = Clamp(1.0 - headErr / ALIGN_SLOW_TOL, ALIGN_MIN_FAC, 1.0);
     double vmag = vel.Length();
     double velFac = vmag < 1.0 ? 1.0 : Clamp((vel / vmag).Dot(pathDir), VEL_MIN_FAC, 1.0);
@@ -1197,6 +1215,25 @@ int ThrustKey(IMyThrust t, MatrixD toLocal)
     if (ax >= ay && ax >= az) return lp.X >= 0 ? 0 : 1;
     if (ay >= az)             return lp.Y >= 0 ? 2 : 3;
     return lp.Z >= 0 ? 4 : 5;
+}
+
+// Which gravity-leg attitude RunCruiseControl should fly (see the attitude block there).
+//   "level" / "nose"  - forced by Custom Data.
+//   "auto" (default)   - fly level (belly-down VTOL climb) when the hull's up-thrust
+//                        outweighs its forward-thrust, i.e. the strong bank is the lift
+//                        bank; otherwise nose along the path. cap[2] = +Y push (lift up),
+//                        cap[5] = -Z push (forward). The 1.1x / 0.9x band is hysteresis so
+//                        a hull that's roughly balanced doesn't flip attitude every tick.
+bool UseLevelFlight()
+{
+    if (cruiseAttitude == "level") return true;
+    if (cruiseAttitude == "nose") return false;
+    double[] cap; MatrixD toLocal;
+    AxisThrust(out cap, out toLocal);
+    double up = cap[2], fwd = cap[5];
+    if (!cruiseFlyLevel && up > fwd * 1.1) cruiseFlyLevel = true;
+    else if (cruiseFlyLevel && up < fwd * 0.9) cruiseFlyLevel = false;
+    return cruiseFlyLevel;
 }
 
 // Zero every thruster/gyro override so the autopilot (or the pilot) has control.
@@ -2210,6 +2247,7 @@ void WriteShuttleSection(MyIni ini)
     ini.Set("shuttle", "cornerLen", cornerLen);
     ini.Set("shuttle", "gyroGain", gyroGain);
     ini.Set("shuttle", "gyroDamp", gyroDamp);
+    ini.Set("shuttle", "cruiseAttitude", cruiseAttitude);
 }
 
 void LoadConfig()
@@ -2254,6 +2292,9 @@ void LoadConfig()
     cornerLen = Math.Max(1.0, ini.Get("shuttle", "cornerLen").ToDouble(cornerLen));
     gyroGain = Math.Max(0.1, ini.Get("shuttle", "gyroGain").ToDouble(gyroGain));
     gyroDamp = Math.Max(0.0, ini.Get("shuttle", "gyroDamp").ToDouble(gyroDamp));
+    // Gravity-leg attitude: only auto/level/nose are meaningful; anything else falls back to auto.
+    string attStr = ini.Get("shuttle", "cruiseAttitude").ToString(cruiseAttitude).Trim().ToLowerInvariant();
+    cruiseAttitude = (attStr == "level" || attStr == "nose") ? attStr : "auto";
 }
 
 void SetModeSilent(string m)

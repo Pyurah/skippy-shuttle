@@ -1,4 +1,4 @@
-const string VERSION = "0.13.6";
+const string VERSION = "0.14.0";
 enum Role { Shuttle, Base }
 enum RunMode { Continuous, OneTrip, OneWay }
 enum DepartTrigger { Auto, Cargo, Timer, Manual }
@@ -51,6 +51,7 @@ double brakeFrac = 0.6;
 double cornerLen = 30;
 double gyroGain = 4.0;
 double gyroDamp = 3.0;
+string cruiseAttitude = "auto";
 DockPose homePose, destPose;
 string homeConn = "", destConn = "";
 List<Vector3D> path = new List<Vector3D>();
@@ -70,6 +71,7 @@ int cruiseIdx = 0;
 double cruiseAccel = 1.0;
 double cruiseProgTimer = 0;
 double cruiseBestDist = double.MaxValue;
+bool cruiseFlyLevel = false;
 const string VIEW_FULL = "full", VIEW_MENU = "menu", VIEW_STATUS = "status", VIEW_TRIP = "trip";
 const int PAGE_MAIN = 0, PAGE_RECORD = 1, PAGE_SETTINGS = 2, PAGE_DEPART = 3;
 int menuPage = PAGE_MAIN;
@@ -644,16 +646,25 @@ bool RunCruiseControl()
     double vmax = legVmax[cruiseIdx];
     double vBrake = Math.Sqrt(vmax * vmax + 2.0 * cruiseAccel * dist);
     double speed = Math.Min(cruiseSpeed, vBrake);
-    Vector3D upTarget;
-    if (grav.LengthSquared() > 1e-3)
+    Vector3D fwdTarget, upTarget;
+    bool inGrav = grav.LengthSquared() > 1e-3;
+    if (inGrav && UseLevelFlight())
+    {
+        Vector3D upWorld = Vector3D.Normalize(-grav);
+        Vector3D horiz = pathDir - pathDir.Dot(upWorld) * upWorld;
+        fwdTarget = horiz.LengthSquared() > 1e-6 ? Vector3D.Normalize(horiz) : rc.WorldMatrix.Forward;
+        upTarget = upWorld;
+    }
+    else if (inGrav)
     {
         Vector3D up = -grav;
         Vector3D perp = up - up.Dot(pathDir) * pathDir;
+        fwdTarget = pathDir;
         upTarget = perp.LengthSquared() > 1e-6 ? Vector3D.Normalize(perp) : rc.WorldMatrix.Up;
     }
-    else upTarget = rc.WorldMatrix.Up;
-    double align = AlignTo(pathDir, upTarget);
-    double headErr = rc.WorldMatrix.Forward.Cross(pathDir).Length();
+    else { fwdTarget = pathDir; upTarget = rc.WorldMatrix.Up; }
+    double align = AlignTo(fwdTarget, upTarget);
+    double headErr = rc.WorldMatrix.Forward.Cross(fwdTarget).Length();
     double alignFac = Clamp(1.0 - headErr / ALIGN_SLOW_TOL, ALIGN_MIN_FAC, 1.0);
     double vmag = vel.Length();
     double velFac = vmag < 1.0 ? 1.0 : Clamp((vel / vmag).Dot(pathDir), VEL_MIN_FAC, 1.0);
@@ -795,6 +806,17 @@ int ThrustKey(IMyThrust t, MatrixD toLocal)
     if (ax >= ay && ax >= az) return lp.X >= 0 ? 0 : 1;
     if (ay >= az)             return lp.Y >= 0 ? 2 : 3;
     return lp.Z >= 0 ? 4 : 5;
+}
+bool UseLevelFlight()
+{
+    if (cruiseAttitude == "level") return true;
+    if (cruiseAttitude == "nose") return false;
+    double[] cap; MatrixD toLocal;
+    AxisThrust(out cap, out toLocal);
+    double up = cap[2], fwd = cap[5];
+    if (!cruiseFlyLevel && up > fwd * 1.1) cruiseFlyLevel = true;
+    else if (cruiseFlyLevel && up < fwd * 0.9) cruiseFlyLevel = false;
+    return cruiseFlyLevel;
 }
 void ReleaseControl()
 {
@@ -1594,6 +1616,7 @@ void WriteShuttleSection(MyIni ini)
     ini.Set("shuttle", "cornerLen", cornerLen);
     ini.Set("shuttle", "gyroGain", gyroGain);
     ini.Set("shuttle", "gyroDamp", gyroDamp);
+    ini.Set("shuttle", "cruiseAttitude", cruiseAttitude);
 }
 void LoadConfig()
 {
@@ -1631,6 +1654,8 @@ void LoadConfig()
     cornerLen = Math.Max(1.0, ini.Get("shuttle", "cornerLen").ToDouble(cornerLen));
     gyroGain = Math.Max(0.1, ini.Get("shuttle", "gyroGain").ToDouble(gyroGain));
     gyroDamp = Math.Max(0.0, ini.Get("shuttle", "gyroDamp").ToDouble(gyroDamp));
+    string attStr = ini.Get("shuttle", "cruiseAttitude").ToString(cruiseAttitude).Trim().ToLowerInvariant();
+    cruiseAttitude = (attStr == "level" || attStr == "nose") ? attStr : "auto";
 }
 void SetModeSilent(string m)
 {

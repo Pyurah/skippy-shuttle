@@ -4,6 +4,30 @@ All notable changes to SkippyShuttle are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.14.0] - 2026-08-13
+
+### Added
+- **Efficient climb attitude — level (VTOL) flight in gravity for lift-heavy hulls.** On the
+  climb to space (or descent) the shuttle used to nose straight up the path toward the next
+  waypoint. On a hull whose strongest thrusters point down (the usual VTOL lift bank), that
+  rotates the strong bank sideways, so the climb ran on the weak rear thrusters — slow and
+  fuel-hungry. The controller now picks its gravity-leg attitude:
+  - **level** — hold the belly straight down and yaw the nose to the *horizontal* bearing of
+    the path (a VTOL climb/descent). The strong down-thrusters do the lifting and the
+    descent-braking.
+  - **nose** — the previous behaviour: nose along the path, belly to the planet (best for
+    rocket-style hulls whose strongest thrust pushes forward).
+  - **auto** *(default)* — measures the hull's own thrust: flies **level** when up-thrust
+    outweighs forward-thrust, else **nose**. Latched with hysteresis so a balanced hull
+    doesn't flip attitude every tick.
+
+  New `cruiseAttitude` key in `[shuttle]` Custom Data (`auto` | `level` | `nose`) overrides
+  the automatic choice. In space (no gravity) the ship always flies nose-forward — lift is
+  irrelevant there. Nothing in the force law changes; only which thruster bank carries the
+  vertical load. The heading throttle now measures against the *nose target* rather than the
+  raw path, so deliberately not pointing up a steep climb (level flight) no longer trips the
+  old ~30 m/s alignment crawl.
+
 ## [0.13.6] - 2026-08-13
 
 ### Fixed

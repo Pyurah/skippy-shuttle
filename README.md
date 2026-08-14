@@ -72,6 +72,7 @@ two docking points (for example, a planet base and an orbital station).
 | `cornerLen` | `30` | Corner-rounding length (m); also the look-ahead blend distance into turns. Larger = wider, faster corners |
 | `gyroGain` | `4` | Attitude P gain — how hard the gyros rotate toward the target heading. Higher = snappier turns |
 | `gyroDamp` | `3` | Attitude damping. Raise it if a hull still wobbles/overshoots/jiggles onto heading; lower toward `2` for snappier turns |
+| `cruiseAttitude` | `auto` | Attitude while flying **in gravity**. `auto` = fly level (belly-down VTOL climb) if the hull is lift-heavy, else nose-to-path; `level` = force VTOL climb (strong down-thrusters lift); `nose` = force nose-along-path. In space it always flies nose-forward regardless |
 
 The recorded route lives in a separate `[route]` section that the script writes for you.
 **To clone a route to another identical ship, copy that whole `[route]` section into its PB.**
@@ -263,8 +264,10 @@ range of each other (see the range note above).
   raising `gyroDamp` no longer makes turns sluggish — raise it only if a specific hull still
   hunts onto heading, or lower toward `2` for snappier turns. `VEL_GAIN` and `APPROACH_KP`
   remain script constants. Cruise behaviour is likewise tunable from Custom Data:
-  `brakeFrac` (how early/gently it brakes), `cornerLen` (corner tightness), and `gyroRpmCap`
-  (max rotation rate — lower it to calm big-angle turn overshoot).
+  `brakeFrac` (how early/gently it brakes), `cornerLen` (corner tightness), `gyroRpmCap`
+  (max rotation rate — lower it to calm big-angle turn overshoot), and `cruiseAttitude`
+  (`auto`/`level`/`nose` — how the ship orients while climbing/descending in gravity;
+  `auto` flies level on lift-heavy hulls so the strong down-thrusters do the climbing).
 - **The script controls your dampeners while flying.** To coast without fuel in space it turns
   dampeners **off** during undock/cruise/dock and restores them **on** when it stops, docks,
   faults, or is recompiled — so a parked or hand-flown ship always holds position. Gravity legs
