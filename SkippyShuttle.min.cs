@@ -1,4 +1,4 @@
-const string VERSION = "0.14.0";
+const string VERSION = "0.14.1";
 enum Role { Shuttle, Base }
 enum RunMode { Continuous, OneTrip, OneWay }
 enum DepartTrigger { Auto, Cargo, Timer, Manual }
@@ -72,6 +72,7 @@ double cruiseAccel = 1.0;
 double cruiseProgTimer = 0;
 double cruiseBestDist = double.MaxValue;
 bool cruiseFlyLevel = false;
+bool gyroResting = false;
 const string VIEW_FULL = "full", VIEW_MENU = "menu", VIEW_STATUS = "status", VIEW_TRIP = "trip";
 const int PAGE_MAIN = 0, PAGE_RECORD = 1, PAGE_SETTINGS = 2, PAGE_DEPART = 3;
 int menuPage = PAGE_MAIN;
@@ -115,6 +116,8 @@ const double CRUISE_STUCK_TIMEOUT = 60.0;
 const double ALIGN_DEADBAND = 0.01;
 const double GYRO_REST_ATT = 0.02;
 const double GYRO_REST_RATE = 0.02;
+const double COAST_HOLD_ENTER = 0.05;
+const double COAST_HOLD_WAKE = 0.10;
 const double COAST_TOL = 0.5;
 const double CRUISE_COAST_BAND = 5.0;
 const double VEL_DEADBAND = 0.4;
@@ -663,7 +666,7 @@ bool RunCruiseControl()
         upTarget = perp.LengthSquared() > 1e-6 ? Vector3D.Normalize(perp) : rc.WorldMatrix.Up;
     }
     else { fwdTarget = pathDir; upTarget = rc.WorldMatrix.Up; }
-    double align = AlignTo(fwdTarget, upTarget);
+    double align = AlignTo(fwdTarget, upTarget, true);
     double headErr = rc.WorldMatrix.Forward.Cross(fwdTarget).Length();
     double alignFac = Clamp(1.0 - headErr / ALIGN_SLOW_TOL, ALIGN_MIN_FAC, 1.0);
     double vmag = vel.Length();
@@ -732,19 +735,37 @@ bool FlyToPose(Vector3D pos, Vector3D fwd, Vector3D up, double arriveDist)
     ApplyForce(force);
     return dist <= arriveDist && align < ALIGN_TOL && vel.Length() < ARRIVE_SPEED;
 }
-double AlignTo(Vector3D targetFwd, Vector3D targetUp) => AlignTo(targetFwd, targetUp, GyroCapRad());
-double AlignTo(Vector3D targetFwd, Vector3D targetUp, double maxRad)
+double AlignTo(Vector3D targetFwd, Vector3D targetUp) => AlignTo(targetFwd, targetUp, GyroCapRad(), false);
+double AlignTo(Vector3D targetFwd, Vector3D targetUp, bool coastHold) => AlignTo(targetFwd, targetUp, GyroCapRad(), coastHold);
+double AlignTo(Vector3D targetFwd, Vector3D targetUp, double maxRad, bool coastHold)
 {
-    Vector3D fErr = rc.WorldMatrix.Forward.Cross(targetFwd);
-    Vector3D uErr = rc.WorldMatrix.Up.Cross(targetUp);
+    Vector3D fwd = rc.WorldMatrix.Forward, up = rc.WorldMatrix.Up;
+    Vector3D fErr = fwd.Cross(targetFwd);
+    if (fwd.Dot(targetFwd) < 0.0)
+    {
+        double l = fErr.Length();
+        fErr = l > 1e-6 ? fErr / l : Vector3D.Normalize(up);
+    }
+    Vector3D uErr = up.Cross(targetUp);
+    if (up.Dot(targetUp) < 0.0)
+    {
+        double l = uErr.Length();
+        uErr = l > 1e-6 ? uErr / l : Vector3D.Normalize(fwd);
+    }
     Vector3D err = fErr + uErr;
     double attErr = fErr.Length() + uErr.Length();
     Vector3D angVel = rc.GetShipVelocities().AngularVelocity;
-    if (attErr < GYRO_REST_ATT && angVel.Length() < GYRO_REST_RATE)
+    if (coastHold)
     {
-        foreach (var g in gyros)
-            if (g != null && g.IsWorking) { g.GyroOverride = true; g.Pitch = 0f; g.Yaw = 0f; g.Roll = 0f; }
-        return attErr;
+        bool stay = gyroResting ? attErr < COAST_HOLD_WAKE
+                                : (attErr < COAST_HOLD_ENTER && angVel.Length() < GYRO_REST_RATE * 2.0);
+        if (stay) { gyroResting = true; HoldGyrosInert(); return attErr; }
+        gyroResting = false;
+    }
+    else
+    {
+        gyroResting = false;
+        if (attErr < GYRO_REST_ATT && angVel.Length() < GYRO_REST_RATE) { HoldGyrosInert(); return attErr; }
     }
     if (err.Length() < ALIGN_DEADBAND) err = Vector3D.Zero;
     Vector3D cmd = err * gyroGain - angVel * gyroDamp;
@@ -760,6 +781,11 @@ double AlignTo(Vector3D targetFwd, Vector3D targetUp, double maxRad)
         g.Roll  = (float)(-local.Z);
     }
     return attErr;
+}
+void HoldGyrosInert()
+{
+    foreach (var g in gyros)
+        if (g != null && g.IsWorking) { g.GyroOverride = true; g.Pitch = 0f; g.Yaw = 0f; g.Roll = 0f; }
 }
 double GyroCapRad()
 {

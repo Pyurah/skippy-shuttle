@@ -42,7 +42,7 @@
  * anywhere in the name. Version tracked in CHANGELOG.md. Semver.
  *//////////////////////////////////////////////////////////////////////////////
 
-const string VERSION = "0.14.0";
+const string VERSION = "0.14.1";
 
 // ---- Roles / states --------------------------------------------------------
 enum Role { Shuttle, Base }
@@ -159,6 +159,7 @@ double cruiseAccel = 1.0;                       // [m/s^2] decel/lateral accel c
 double cruiseProgTimer = 0;                     // seconds since the ship last closed on its target waypoint (stuck watchdog)
 double cruiseBestDist = double.MaxValue;        // closest approach so far to the current waypoint; getting nearer resets the watchdog. A simplified straight is one waypoint tens of km away, so timing waypoint *arrivals* false-faults on a leg the ship is flying perfectly (v0.13.2)
 bool cruiseFlyLevel = false;                    // latched decision (with hysteresis) for auto cruiseAttitude: true = fly belly-down/VTOL, false = nose-to-path. See UseLevelFlight
+bool gyroResting = false;                        // latch: gyros held inert on-heading during coast-hold (see AlignTo). Wakes only on real heading drift, not angular-velocity noise from thruster torque - stops the gyros fighting the translation controller at cruise
 
 // ---- Display views (ship role) ---------------------------------------------
 // Each ship screen shows ONE view, so a 3-screen cockpit can split the display
@@ -227,6 +228,8 @@ const double CRUISE_STUCK_TIMEOUT = 60.0; // s without closing on the target way
 const double ALIGN_DEADBAND = 0.01;       // ~0.6 deg: below this the gyros rest instead of hunting the target
 const double GYRO_REST_ATT = 0.02;        // rad (~1.1 deg): on-heading tolerance for the rest deadband
 const double GYRO_REST_RATE = 0.02;       // rad/s (~1.1 deg/s): below this spin, hold gyros inert instead of nulling AngularVelocity noise
+const double COAST_HOLD_ENTER = 0.05;     // rad (~2.9 deg): cruise heading within this of the path latches the gyros inert (nose direction doesn't steer - thrust is world-space omni - so a small steady nose/path offset is harmless and must NOT be chased)
+const double COAST_HOLD_WAKE = 0.10;      // rad (~5.7 deg): only a heading drift past this (or a corner) re-engages the cruise gyros. Wide gap from ENTER = strong hysteresis so the nose settles instead of hunting the ever-moving path vector
 const double COAST_TOL = 0.5;             // m/s velocity error below which the ship coasts (thrust off) in space
 const double CRUISE_COAST_BAND = 5.0;     // m/s along-track overshoot tolerated without reverse-thrust (kills speed-cap pulsing)
 const double VEL_DEADBAND = 0.4;          // m/s: velocity-tracking error below this is not corrected (hover kept) - kills the vertical/cross-track thrust chatter, worst in low gravity
@@ -968,7 +971,7 @@ bool RunCruiseControl()
         upTarget = perp.LengthSquared() > 1e-6 ? Vector3D.Normalize(perp) : rc.WorldMatrix.Up;
     }
     else { fwdTarget = pathDir; upTarget = rc.WorldMatrix.Up; }
-    double align = AlignTo(fwdTarget, upTarget);
+    double align = AlignTo(fwdTarget, upTarget, true);   // coast-hold: latch gyros inert on heading, don't fight thrust-torque noise
 
     // Turn before accelerating; don't fly fast sideways. Both factors are floored so the
     // ship can still creep and re-align rather than dead-stall. The heading throttle reads
@@ -1097,29 +1100,64 @@ bool FlyToPose(Vector3D pos, Vector3D fwd, Vector3D up, double arriveDist)
 // clamped to a gentle max rate (PAM-style) that never hurts docking precision.
 // Returns an error metric (~sin of the misalignment angle); near zero when
 // forward AND up both match the target.
-double AlignTo(Vector3D targetFwd, Vector3D targetUp) => AlignTo(targetFwd, targetUp, GyroCapRad());
+double AlignTo(Vector3D targetFwd, Vector3D targetUp) => AlignTo(targetFwd, targetUp, GyroCapRad(), false);
+double AlignTo(Vector3D targetFwd, Vector3D targetUp, bool coastHold) => AlignTo(targetFwd, targetUp, GyroCapRad(), coastHold);
 
-double AlignTo(Vector3D targetFwd, Vector3D targetUp, double maxRad)
+double AlignTo(Vector3D targetFwd, Vector3D targetUp, double maxRad, bool coastHold)
 {
-    Vector3D fErr = rc.WorldMatrix.Forward.Cross(targetFwd);
-    Vector3D uErr = rc.WorldMatrix.Up.Cross(targetUp);
+    Vector3D fwd = rc.WorldMatrix.Forward, up = rc.WorldMatrix.Up;
+    Vector3D fErr = fwd.Cross(targetFwd);
+    // The cross product is sin(theta)*axis: it SHRINKS toward zero as the misalignment
+    // approaches 180 deg - exactly when the turn is largest - so a near-reversed target
+    // (dock nose-in, then undock and head back out is a ~180 deg yaw) produces almost no
+    // command and the ship stalls at the unstable equilibrium, waiting ~30 s for float
+    // noise to tip it off. Past 90 deg (dot < 0) replace the shrinking term with a
+    // full-strength unit turn about a valid axis, so the back half of the rotation drives
+    // just as hard as the front. Also stops attErr reading ~0 (falsely "aligned") at 180.
+    if (fwd.Dot(targetFwd) < 0.0)
+    {
+        double l = fErr.Length();
+        fErr = l > 1e-6 ? fErr / l : Vector3D.Normalize(up);   // any axis perpendicular to forward if exactly reversed
+    }
+    Vector3D uErr = up.Cross(targetUp);
+    if (up.Dot(targetUp) < 0.0)
+    {
+        double l = uErr.Length();
+        uErr = l > 1e-6 ? uErr / l : Vector3D.Normalize(fwd);   // roll axis if the ship is exactly inverted
+    }
     Vector3D err = fErr + uErr;   // combined world-space rotation axis * angle
     double attErr = fErr.Length() + uErr.Length();
 
     Vector3D angVel = rc.GetShipVelocities().AngularVelocity;   // world rad/s
 
-    // Rest deadband: once the nose is on heading AND the hull isn't actually rotating,
-    // hold the gyros fully inert rather than feeding AngularVelocity back through the
-    // damping term. The reported angular velocity carries frame-to-frame float noise,
-    // so a gyro that's strong relative to the ship's mass chatters forever chasing
-    // "motion" that isn't real. Capping RPM can't fix this - the twitch lives at the
-    // low end - only stopping the command does. Re-engages the instant a real
-    // disturbance pushes us back outside the band.
-    if (attErr < GYRO_REST_ATT && angVel.Length() < GYRO_REST_RATE)
+    // Rest deadband: hold the gyros fully inert once on-heading so they stop feeding
+    // AngularVelocity noise back through the damping term (a strong gyro chatters forever
+    // chasing "motion" that's just float noise; capping RPM can't fix it - only stopping
+    // the command does). Two modes:
+    //   coastHold (cruise): LATCH inert on heading alone and ignore angular-velocity
+    //     spikes. At cruise the nose target is the direction to a waypoint tens of km
+    //     off; as the ship coasts (and drifts a hair cross-track) that vector inches
+    //     around, and off-centre thruster corrections add little torque pulses - so the
+    //     nose and the path never converge to the arc-minute rest band and the gyros hunt
+    //     it every tick, fighting the translation controller (the jitter the pilot sees).
+    //     Since the nose direction doesn't steer (thrust is world-space omni-directional),
+    //     a few degrees of steady nose/path offset is cosmetic. So latch inert once the
+    //     heading is roughly on the path (COAST_HOLD_ENTER, ~2.9 deg) and only re-engage
+    //     on a real drift or corner (COAST_HOLD_WAKE, ~5.7 deg) - wide hysteresis lets the
+    //     nose settle instead of chasing.
+    //   precision (docking): strict - rest only when heading AND spin are both tiny, so a
+    //     docked-attitude match stays exact and FlyToPose can still seat the connector.
+    if (coastHold)
     {
-        foreach (var g in gyros)
-            if (g != null && g.IsWorking) { g.GyroOverride = true; g.Pitch = 0f; g.Yaw = 0f; g.Roll = 0f; }
-        return attErr;
+        bool stay = gyroResting ? attErr < COAST_HOLD_WAKE
+                                : (attErr < COAST_HOLD_ENTER && angVel.Length() < GYRO_REST_RATE * 2.0);
+        if (stay) { gyroResting = true; HoldGyrosInert(); return attErr; }
+        gyroResting = false;
+    }
+    else
+    {
+        gyroResting = false;
+        if (attErr < GYRO_REST_ATT && angVel.Length() < GYRO_REST_RATE) { HoldGyrosInert(); return attErr; }
     }
 
     // Inside the deadband, stop chasing the target: drop the P term so the command is
@@ -1144,6 +1182,13 @@ double AlignTo(Vector3D targetFwd, Vector3D targetUp, double maxRad)
         g.Roll  = (float)(-local.Z);
     }
     return attErr;
+}
+
+// Freeze every gyro (override on, zero rate) - the inert state of the rest deadband.
+void HoldGyrosInert()
+{
+    foreach (var g in gyros)
+        if (g != null && g.IsWorking) { g.GyroOverride = true; g.Pitch = 0f; g.Yaw = 0f; g.Roll = 0f; }
 }
 
 // Gyro angular-rate cap in rad/s. gyroRpmCap>0 uses that; otherwise PAM's gentle

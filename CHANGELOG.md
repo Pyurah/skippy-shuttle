@@ -4,6 +4,33 @@ All notable changes to SkippyShuttle are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.14.1] - 2026-08-13
+
+### Fixed
+- **No more ~30-second stall aligning for cruise after undocking (worst at the station).** The
+  attitude controller's error term is a cross product (`Forward × targetForward`), whose
+  magnitude is `sin(θ)` — it *shrinks to zero as the misalignment approaches 180°*, exactly when
+  the turn is largest. Undocking is the worst case: you dock nose-in, then leave heading back the
+  way you came — a ~180° yaw. Near that reversal the controller commanded almost no rotation, so
+  the ship sat at the unstable equilibrium waiting for physics float-noise to tip it off (and
+  `attErr ≈ 0` there even meant it could briefly read as "aligned" while pointing backwards). Past
+  90° (`Forward · targetForward < 0`) the shrinking cross term is now replaced with a
+  full-strength unit turn about a valid axis, so the back half of the rotation drives just as hard
+  as the front and a near-180° flip snaps around promptly. Same guard on the up-vector for an
+  inverted hull.
+- **Gyros no longer fight the thrusters (jitter) while cruising in space.** The nose target is
+  the direction to a waypoint tens of km away; as the ship coasts and drifts a hair cross-track
+  that vector inches around, and off-center thruster corrections add small torque pulses — so the
+  ship's heading and its path never *quite* converge to the arc-minute rest band, and the gyros
+  hunt the residual every tick, tugging against the translation controller (the visible jitter:
+  travel direction and nose never fully align, and the controllers fight over it). Because the
+  nose direction doesn't actually steer the ship — thrust is applied omnidirectionally in world
+  space — a few degrees of steady nose/path offset is purely cosmetic. Cruise now uses a **latched
+  heading-hold with wide hysteresis**: the gyros go inert once the heading is *roughly* on the
+  path (~2.9°) and only re-engage on a genuine drift or corner (~5.7°), so the nose settles at a
+  small offset instead of chasing a target it can never pin. Docking is unaffected — it keeps the
+  strict arc-minute rest so the connector still seats on an exact attitude match.
+
 ## [0.14.0] - 2026-08-13
 
 ### Added

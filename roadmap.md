@@ -4,7 +4,7 @@ Master tracking document for the SkippyShuttle Programmable Block script.
 
 ## Current status
 
-- **Version:** 0.14.0
+- **Version:** 0.14.1
 - **Phase:** 1 (Core shuttle) + LCD UI + orientation-matched docking + per-connector departure
   triggers + per-screen display views (+ per-screen padding) + base-role config hygiene — delivered,
   pending in-world validation
@@ -323,6 +323,15 @@ Delivered into the core (was conditional). Docking is no longer nose-first-only.
       heading throttle now reads the nose target, not the raw path, so a deliberate off-path nose
       in level flight doesn't retrigger the ~30 m/s alignment crawl. *Field-confirm awaited: full
       climb speed with the lift bank carrying the climb.*
+- [x] **Attitude 180° singularity + cruise gyro-hold (v0.14.1)** — two space-side attitude fixes.
+      The gyro error is a cross product (`Forward × targetFwd`, magnitude `sin θ`) that collapses
+      to zero at 180°, so the ~180° undock yaw (dock nose-in, leave reversed) stalled for ~30 s at
+      the unstable equilibrium until noise tipped it; past 90° the shrinking term is now swapped for
+      a full-strength unit turn about a valid axis. And the gyro rest state only latched when
+      angular velocity was also tiny, which thrust-torque pulses kept breaking at cruise, so the
+      gyros fought the translation controller (jitter); cruise now latches a heading-hold that
+      ignores angular-velocity noise and wakes only on real heading drift. Docking keeps the strict
+      rest. *Field-confirm awaited: snappy undock turn, steady gyros at cruise in space.*
 - [ ] Multi-stop routes (more than two connectors).
 - [ ] Per-item load manifests (fill specific items to target amounts).
 
