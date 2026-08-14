@@ -1,4 +1,4 @@
-const string VERSION = "0.13.1";
+const string VERSION = "0.13.6";
 enum Role { Shuttle, Base }
 enum RunMode { Continuous, OneTrip, OneWay }
 enum DepartTrigger { Auto, Cargo, Timer, Manual }
@@ -69,6 +69,7 @@ List<double> legVmax = new List<double>();
 int cruiseIdx = 0;
 double cruiseAccel = 1.0;
 double cruiseProgTimer = 0;
+double cruiseBestDist = double.MaxValue;
 const string VIEW_FULL = "full", VIEW_MENU = "menu", VIEW_STATUS = "status", VIEW_TRIP = "trip";
 const int PAGE_MAIN = 0, PAGE_RECORD = 1, PAGE_SETTINGS = 2, PAGE_DEPART = 3;
 int menuPage = PAGE_MAIN;
@@ -110,7 +111,11 @@ const double ALIGN_MIN_FAC = 0.15;
 const double VEL_MIN_FAC = 0.30;
 const double CRUISE_STUCK_TIMEOUT = 60.0;
 const double ALIGN_DEADBAND = 0.01;
+const double GYRO_REST_ATT = 0.02;
+const double GYRO_REST_RATE = 0.02;
 const double COAST_TOL = 0.5;
+const double CRUISE_COAST_BAND = 5.0;
+const double VEL_DEADBAND = 0.4;
 Program()
 {
     Runtime.UpdateFrequency = UpdateFrequency.Update10;
@@ -503,8 +508,7 @@ void TickCruise(bool toDest)
     if (!CruiseArmed(toDest)) { ArmCruise(toDest); return; }
     cruiseProgTimer += dt;
     bool done = RunCruiseControl();
-    statusMsg = (toDest ? "Cruising to destination" : "Cruising home")
-              + "  ETA " + FormatEta();
+    statusMsg = (toDest ? "Cruising to destination" : "Cruising home") + "  ETA " + FormatEta();
     if (done)
     {
         cruiseArmed = false;
@@ -537,6 +541,7 @@ void ArmCruise(bool toDest)
     BuildVelocityProfile();
     cruiseIdx = 0;
     cruiseProgTimer = 0;
+    cruiseBestDist = double.MaxValue;
     cruiseArmed = true;
     cruiseArmedToDest = toDest;
     statusMsg = toDest ? "Cruising to destination" : "Cruising home";
@@ -608,7 +613,7 @@ void AdvanceCursor(Vector3D pos)
         Vector3D seg = next - cur;
         bool passed = seg.LengthSquared() > 1e-6 &&
                       (pos - cur).Dot(Vector3D.Normalize(seg)) > 0;
-        if (arrived || passed) { cruiseIdx++; cruiseProgTimer = 0; }
+        if (arrived || passed) { cruiseIdx++; cruiseProgTimer = 0; cruiseBestDist = double.MaxValue; }
         else break;
     }
 }
@@ -624,6 +629,7 @@ bool RunCruiseControl()
     Vector3D toWp = target - pos;
     double dist = toWp.Length();
     Vector3D pathDir = dist > 1e-3 ? toWp / dist : rc.WorldMatrix.Forward;
+    if (dist < cruiseBestDist - 1.0) { cruiseBestDist = dist; cruiseProgTimer = 0; }
     if (cruiseIdx < legWps.Count - 1 && dist < cornerLen)
     {
         Vector3D nextSeg = legWps[cruiseIdx + 1] - target;
@@ -638,9 +644,17 @@ bool RunCruiseControl()
     double vmax = legVmax[cruiseIdx];
     double vBrake = Math.Sqrt(vmax * vmax + 2.0 * cruiseAccel * dist);
     double speed = Math.Min(cruiseSpeed, vBrake);
-    Vector3D upTarget = grav.LengthSquared() > 1e-3 ? Vector3D.Normalize(-grav) : rc.WorldMatrix.Up;
+    Vector3D upTarget;
+    if (grav.LengthSquared() > 1e-3)
+    {
+        Vector3D up = -grav;
+        Vector3D perp = up - up.Dot(pathDir) * pathDir;
+        upTarget = perp.LengthSquared() > 1e-6 ? Vector3D.Normalize(perp) : rc.WorldMatrix.Up;
+    }
+    else upTarget = rc.WorldMatrix.Up;
     double align = AlignTo(pathDir, upTarget);
-    double alignFac = Clamp(1.0 - align / ALIGN_SLOW_TOL, ALIGN_MIN_FAC, 1.0);
+    double headErr = rc.WorldMatrix.Forward.Cross(pathDir).Length();
+    double alignFac = Clamp(1.0 - headErr / ALIGN_SLOW_TOL, ALIGN_MIN_FAC, 1.0);
     double vmag = vel.Length();
     double velFac = vmag < 1.0 ? 1.0 : Clamp((vel / vmag).Dot(pathDir), VEL_MIN_FAC, 1.0);
     speed *= alignFac * velFac;
@@ -650,7 +664,12 @@ bool RunCruiseControl()
     if (inSpace && align < ALIGN_MOVE_TOL && dv.Length() < COAST_TOL)
         ZeroThrusters();
     else
+    {
+        double along = dv.Dot(pathDir);
+        if (along < 0.0 && along > -CRUISE_COAST_BAND) dv -= along * pathDir;
+        if (dv.Length() < VEL_DEADBAND) dv = Vector3D.Zero;
         ApplyForce(dv * mass * VEL_GAIN - grav * mass);
+    }
     bool atEnd = cruiseIdx == legWps.Count - 1;
     return atEnd && dist < WpArriveRadius() && vmag < ARRIVE_SPEED;
 }
@@ -708,8 +727,15 @@ double AlignTo(Vector3D targetFwd, Vector3D targetUp, double maxRad)
     Vector3D fErr = rc.WorldMatrix.Forward.Cross(targetFwd);
     Vector3D uErr = rc.WorldMatrix.Up.Cross(targetUp);
     Vector3D err = fErr + uErr;
-    if (err.Length() < ALIGN_DEADBAND) err = Vector3D.Zero;
+    double attErr = fErr.Length() + uErr.Length();
     Vector3D angVel = rc.GetShipVelocities().AngularVelocity;
+    if (attErr < GYRO_REST_ATT && angVel.Length() < GYRO_REST_RATE)
+    {
+        foreach (var g in gyros)
+            if (g != null && g.IsWorking) { g.GyroOverride = true; g.Pitch = 0f; g.Yaw = 0f; g.Roll = 0f; }
+        return attErr;
+    }
+    if (err.Length() < ALIGN_DEADBAND) err = Vector3D.Zero;
     Vector3D cmd = err * gyroGain - angVel * gyroDamp;
     double m = cmd.Length();
     if (m > maxRad && m > 1e-6) cmd *= maxRad / m;
@@ -722,7 +748,7 @@ double AlignTo(Vector3D targetFwd, Vector3D targetUp, double maxRad)
         g.Yaw   = (float)(-local.Y);
         g.Roll  = (float)(-local.Z);
     }
-    return fErr.Length() + uErr.Length();
+    return attErr;
 }
 double GyroCapRad()
 {
@@ -733,6 +759,7 @@ double GyroCapRad()
 void ApplyForce(Vector3D worldForce)
 {
     if (rc == null) return;
+    if (!IsFinite(worldForce)) { ZeroThrusters(); return; }
     double[] cap; MatrixD toLocal;
     AxisThrust(out cap, out toLocal);
     Vector3D lf = Vector3D.TransformNormal(worldForce, toLocal);
@@ -748,6 +775,11 @@ void ApplyForce(Vector3D worldForce)
         double share = need[k] * (t.MaxEffectiveThrust / cap[k]);
         t.ThrustOverride = (float)Math.Min(share, t.MaxEffectiveThrust);
     }
+}
+static bool IsFinite(Vector3D v)
+{
+    return !double.IsNaN(v.X) && !double.IsNaN(v.Y) && !double.IsNaN(v.Z) &&
+           !double.IsInfinity(v.X) && !double.IsInfinity(v.Y) && !double.IsInfinity(v.Z);
 }
 void AxisThrust(out double[] cap, out MatrixD toLocal)
 {

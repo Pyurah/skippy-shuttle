@@ -4,6 +4,97 @@ All notable changes to SkippyShuttle are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.13.6] - 2026-08-13
+
+### Fixed
+- **Killed the vertical up/down jitter during cruise in low gravity.** After v0.13.5 cured
+  the along-track speed-cap pulsing, a vertical shake remained. Root cause: the cruise
+  vertical force is `dv·mass·VEL_GAIN − grav·mass` (a hover term plus a velocity
+  correction). High up, where `g ≈ 0.05` (~0.49 m/s²), the hover bias is tiny, so a vertical
+  velocity error of only `g / VEL_GAIN ≈ 0.25 m/s` flips the **net** vertical force sign —
+  swapping the up-thruster bank for the down-thruster bank. Frame-to-frame physics noise
+  crosses that line constantly, so the banks toggle at 60 Hz. The along-track coast band
+  (v0.13.5) can't catch it because vertical error is perpendicular to the path. Added a small
+  **velocity-tracking deadband** (`VEL_DEADBAND = 0.4 m/s`): sub-threshold velocity error is
+  no longer corrected, while the hover term is always kept, so the ship rides through the
+  noise. Path position still self-corrects because the desired velocity always points at the
+  target waypoint. Full-gravity behaviour (e.g. a planet base) is unaffected — there the
+  hover term dominates and the sign never flips.
+
+## [0.13.5] - 2026-08-13
+
+### Fixed
+- **Engines no longer pulse/shake while holding the cruise cap.** The cruise governor is a
+  pure velocity P-controller, so at a hard speed cap it reverse-thrusts the instant the ship
+  ticks a hair over: over → brake, under → accelerate, repeating at 60 Hz. That limit cycle
+  is the shaking and throttle chatter felt at speed. The controller now **coasts through a
+  small along-track overshoot** (`CRUISE_COAST_BAND = 5 m/s`): when the ship is only a few
+  m/s fast *along the path*, that component of the velocity error is nulled so it drifts back
+  down to the cap instead of fighting itself. Cross-track/vertical correction and the
+  gravity-hover term stay live, and a genuine slowdown (corner or arrival) drives the
+  along-track error well past the band so real braking still fires hard.
+
+### Security
+- **Hardened the thrust path against non-finite overrides.** `ApplyForce` now refuses to
+  write a `NaN`/`Infinity` `ThrustOverride`, cutting thrust for that tick instead. A
+  non-finite override is one of the few things a Programmable Block can do that propagates
+  into the physics solver and can destabilise or crash a server, and the previous per-thruster
+  skip guard (`need <= 1e-3`) is `false` for `NaN`, so a bad force would have sailed straight
+  through. No known upstream produces one today — the cruise math is length-guarded — but this
+  closes the vector defensively.
+
+## [0.13.4] - 2026-08-13
+
+### Fixed
+- **Cruise no longer caps at ~30 m/s the entire time it's in gravity (the real fix).**
+  v0.13.3 changed the speed governor to throttle on heading error only, on the theory that
+  a transient *roll/level* error was dragging it down — but the crawl persisted, so an
+  in-world diagnostic was added to read the live throttle terms. It showed a **standing
+  ~45° heading error** on the base→station climb (`aF0.15 hd45`, velocity perfectly on
+  path), which the heading throttle correctly floored to `0.15` → `cruiseSpeed × 0.15 ≈
+  30`. Root cause: the attitude controller was told to hold **Forward = pathDir** *and*
+  **Up = −gravity** simultaneously. Those can both be satisfied only when they're
+  orthogonal; on a climbing or descending leg they aren't, so the gyro settled on a
+  ~45° compromise heading it could never resolve. The cruise `upTarget` is now the
+  component of anti-gravity **perpendicular to the flight direction** (Gram-Schmidt), so
+  Forward and Up are always orthogonal: the gyro hits the waypoint heading exactly, the
+  throttle opens to full, and the belly still points as far down as the path allows.
+  Degenerate case (flying straight along gravity) falls back to the current up.
+
+## [0.13.3] - 2026-08-13
+
+### Fixed
+- **Gyros no longer micro-jitter when holding a heading.** The attitude loop fed the
+  Remote Control's reported `AngularVelocity` back through the damping term (`-angVel *
+  gyroDamp`) every 60 Hz frame. That reading carries frame-to-frame float noise, so a
+  ship whose gyros are strong relative to its mass chattered forever chasing "motion"
+  that wasn't real — visible even at `gyroRpmCap = 2`, because the twitch lives at the
+  low end where an RPM cap can't reach. Added a **rest deadband** (`GYRO_REST_ATT`,
+  `GYRO_REST_RATE`): once the nose is on heading *and* the hull isn't actually rotating,
+  the gyros are held fully inert instead of nulling noise, and re-engage the instant a
+  real disturbance pushes them out of the band.
+- **Cruise no longer crawls to ~30 m/s when crossing into gravity.** The forward-speed
+  governor throttled on the *combined* attitude error (heading + roll). In space that's
+  only heading error, but the moment the ship enters a planet's gravity well its "up"
+  target flips to anti-gravity, adding a large standing **roll/level error** until it
+  rolls level — which dragged the throttle down and capped forward speed even though
+  rolling to level doesn't affect forward translation (a low `gyroRpmCap` made it worse
+  by re-leveling slowly). The governor now throttles on **heading error only**, so the
+  ship keeps cruise speed through the space→gravity transition while it levels.
+
+## [0.13.2] - 2026-08-13
+
+### Fixed
+- **Cruise no longer false-faults on long straights (regression from v0.13.0).** The
+  "cruise stuck" watchdog measured *time since the waypoint cursor last advanced* and
+  faulted after 60 s. That was safe when breadcrumbs sat ≤250 m apart, but collinear
+  simplification (v0.13.0) collapses a straight run to a **single** waypoint that can be
+  tens of km away — so the ship flew a perfectly good straight for minutes without
+  "advancing", tripped the 60 s watchdog, and dropped to `Faulted` (which restores
+  dampeners) mid-cruise. The watchdog is now **progress-based**: it resets whenever the
+  ship gets meaningfully closer (>1 m) to its current target waypoint, so a fast straight
+  never trips it while a genuine stall (no closing on the target for 60 s) still faults.
+
 ## [0.13.1] - 2026-08-13
 
 ### Added

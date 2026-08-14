@@ -39,7 +39,7 @@
  * anywhere in the name. Version tracked in CHANGELOG.md. Semver.
  *//////////////////////////////////////////////////////////////////////////////
 
-const string VERSION = "0.13.1";
+const string VERSION = "0.13.6";
 
 // ---- Roles / states --------------------------------------------------------
 enum Role { Shuttle, Base }
@@ -152,7 +152,8 @@ List<Vector3D> legWps = new List<Vector3D>();   // flight-ordered leg waypoints 
 List<double> legVmax = new List<double>();      // parallel: max speed [m/s] permitted AT legWps[i]
 int cruiseIdx = 0;                              // index of the waypoint currently flown toward
 double cruiseAccel = 1.0;                       // [m/s^2] decel/lateral accel cached for this leg (mass-dependent)
-double cruiseProgTimer = 0;                     // seconds since the cursor last advanced (stuck watchdog)
+double cruiseProgTimer = 0;                     // seconds since the ship last closed on its target waypoint (stuck watchdog)
+double cruiseBestDist = double.MaxValue;        // closest approach so far to the current waypoint; getting nearer resets the watchdog. A simplified straight is one waypoint tens of km away, so timing waypoint *arrivals* false-faults on a leg the ship is flying perfectly (v0.13.2)
 
 // ---- Display views (ship role) ---------------------------------------------
 // Each ship screen shows ONE view, so a 3-screen cockpit can split the display
@@ -217,9 +218,13 @@ const double CORNER_STRAIGHT_TOL = 0.10;  // rad (~6 deg): below this deflection
 const double ALIGN_SLOW_TOL = 0.5;        // attitude error at which the forward-speed factor hits its floor
 const double ALIGN_MIN_FAC = 0.15;        // never fully stall forward speed while re-aiming (keeps creeping to re-align)
 const double VEL_MIN_FAC = 0.30;          // floor on the sideways-velocity speed cut
-const double CRUISE_STUCK_TIMEOUT = 60.0; // s without cursor progress -> Faulted
+const double CRUISE_STUCK_TIMEOUT = 60.0; // s without closing on the target waypoint -> Faulted
 const double ALIGN_DEADBAND = 0.01;       // ~0.6 deg: below this the gyros rest instead of hunting the target
+const double GYRO_REST_ATT = 0.02;        // rad (~1.1 deg): on-heading tolerance for the rest deadband
+const double GYRO_REST_RATE = 0.02;       // rad/s (~1.1 deg/s): below this spin, hold gyros inert instead of nulling AngularVelocity noise
 const double COAST_TOL = 0.5;             // m/s velocity error below which the ship coasts (thrust off) in space
+const double CRUISE_COAST_BAND = 5.0;     // m/s along-track overshoot tolerated without reverse-thrust (kills speed-cap pulsing)
+const double VEL_DEADBAND = 0.4;          // m/s: velocity-tracking error below this is not corrected (hover kept) - kills the vertical/cross-track thrust chatter, worst in low gravity
 
 // ============================================================================
 //  Lifecycle
@@ -734,8 +739,7 @@ void TickCruise(bool toDest)
 
     cruiseProgTimer += dt;
     bool done = RunCruiseControl();
-    statusMsg = (toDest ? "Cruising to destination" : "Cruising home")
-              + "  ETA " + FormatEta();
+    statusMsg = (toDest ? "Cruising to destination" : "Cruising home") + "  ETA " + FormatEta();
 
     if (done)
     {
@@ -775,6 +779,7 @@ void ArmCruise(bool toDest)
     BuildVelocityProfile();
     cruiseIdx = 0;
     cruiseProgTimer = 0;
+    cruiseBestDist = double.MaxValue;
     cruiseArmed = true;
     cruiseArmedToDest = toDest;
     statusMsg = toDest ? "Cruising to destination" : "Cruising home";
@@ -875,7 +880,7 @@ void AdvanceCursor(Vector3D pos)
         Vector3D seg = next - cur;
         bool passed = seg.LengthSquared() > 1e-6 &&
                       (pos - cur).Dot(Vector3D.Normalize(seg)) > 0;
-        if (arrived || passed) { cruiseIdx++; cruiseProgTimer = 0; }
+        if (arrived || passed) { cruiseIdx++; cruiseProgTimer = 0; cruiseBestDist = double.MaxValue; }
         else break;
     }
 }
@@ -900,6 +905,13 @@ bool RunCruiseControl()
     double dist = toWp.Length();
     Vector3D pathDir = dist > 1e-3 ? toWp / dist : rc.WorldMatrix.Forward;
 
+    // Stuck watchdog: reset the timer whenever we get meaningfully closer to the
+    // current waypoint. Timing waypoint *arrivals* (the pre-0.13.2 scheme) false-faults
+    // now that a simplified straight is a single waypoint tens of km away - the ship
+    // flies it perfectly for minutes without ever "advancing". Progress toward the
+    // target, not arrival at it, is what proves the ship isn't truly stuck.
+    if (dist < cruiseBestDist - 1.0) { cruiseBestDist = dist; cruiseProgTimer = 0; }
+
     // Ease toward the next segment's direction as we near a corner.
     if (cruiseIdx < legWps.Count - 1 && dist < cornerLen)
     {
@@ -918,13 +930,36 @@ bool RunCruiseControl()
     double vBrake = Math.Sqrt(vmax * vmax + 2.0 * cruiseAccel * dist);
     double speed = Math.Min(cruiseSpeed, vBrake);
 
-    // Attitude: face travel; hold up = anti-gravity (planet) or current up (space, no roll).
-    Vector3D upTarget = grav.LengthSquared() > 1e-3 ? Vector3D.Normalize(-grav) : rc.WorldMatrix.Up;
+    // Attitude: face travel; hold the belly toward the planet. Crucially, use the
+    // component of anti-gravity that is PERPENDICULAR to the flight direction
+    // (Gram-Schmidt), not raw -gravity. Forward=pathDir and Up=-gravity can both be
+    // satisfied only when they're orthogonal; on a climbing or descending leg they
+    // aren't, so a rigid up = -gravity forces the gyro into a compromise that leaves a
+    // large steady heading error (~45 deg was measured on the base->station climb).
+    // The alignFac throttle then reads that as "badly aimed" and pins cruise at ~30 m/s
+    // for the whole gravity leg, even though the ship is tracking the path perfectly.
+    // Orthogonalising up against pathDir lets the gyro hit the heading exactly while
+    // keeping the belly as down as the path allows. In space (no gravity) just hold the
+    // current up so we don't roll.
+    Vector3D upTarget;
+    if (grav.LengthSquared() > 1e-3)
+    {
+        Vector3D up = -grav;
+        Vector3D perp = up - up.Dot(pathDir) * pathDir;
+        upTarget = perp.LengthSquared() > 1e-6 ? Vector3D.Normalize(perp) : rc.WorldMatrix.Up;
+    }
+    else upTarget = rc.WorldMatrix.Up;
     double align = AlignTo(pathDir, upTarget);
 
     // Turn before accelerating; don't fly fast sideways. Both factors are floored
-    // so the ship can still creep and re-align rather than dead-stall.
-    double alignFac = Clamp(1.0 - align / ALIGN_SLOW_TOL, ALIGN_MIN_FAC, 1.0);
+    // so the ship can still creep and re-align rather than dead-stall. The heading
+    // throttle uses *forward* error only (Forward x pathDir): being rolled off level
+    // - e.g. while re-leveling to gravity's up as it crosses into the planet well -
+    // doesn't affect forward translation, so it must not cut cruise speed. Using the
+    // combined attitude error here made the ship crawl (~30 m/s) through the whole
+    // space->gravity transition while it slowly rolled level.
+    double headErr = rc.WorldMatrix.Forward.Cross(pathDir).Length();
+    double alignFac = Clamp(1.0 - headErr / ALIGN_SLOW_TOL, ALIGN_MIN_FAC, 1.0);
     double vmag = vel.Length();
     double velFac = vmag < 1.0 ? 1.0 : Clamp((vel / vmag).Dot(pathDir), VEL_MIN_FAC, 1.0);
     speed *= alignFac * velFac;
@@ -941,7 +976,29 @@ bool RunCruiseControl()
     if (inSpace && align < ALIGN_MOVE_TOL && dv.Length() < COAST_TOL)
         ZeroThrusters();
     else
+    {
+        // Don't reverse-thrust just to shave a small along-track overshoot of the speed
+        // cap. Holding a hard cap with a pure velocity P-controller makes the engines
+        // pulse on/off at 60 Hz: tick a hair over the cap -> dv flips negative -> brake;
+        // next tick you're under -> accelerate. That limit cycle is the shaking/throttle
+        // chatter felt at the cap. If we're only a few m/s fast *along the path*, null
+        // just that component so the ship coasts back down to the cap instead of fighting
+        // itself. Cross-track/vertical correction and the -grav*mass hover term stay live,
+        // and a genuine slowdown (corner or arrival) drives the along-track error strongly
+        // negative (past the band) so real braking still fires hard.
+        double along = dv.Dot(pathDir);
+        if (along < 0.0 && along > -CRUISE_COAST_BAND) dv -= along * pathDir;
+
+        // Don't chase sub-threshold velocity error. What's left after the along-track
+        // coast is vertical/cross-track chatter: in low gravity the -grav*mass hover bias
+        // is tiny, so a velocity error of only ~g/VEL_GAIN flips the *net* vertical force
+        // sign and swaps the up-thruster bank for the down-thruster bank every 60 Hz frame
+        // (the visible up/down shake). Deadbanding the correction - while always keeping
+        // the hover term - lets the ship ride through that noise; path position still
+        // self-corrects because desiredVel always points at the target waypoint.
+        if (dv.Length() < VEL_DEADBAND) dv = Vector3D.Zero;
         ApplyForce(dv * mass * VEL_GAIN - grav * mass);   // identical law to FlyToPose
+    }
 
     bool atEnd = cruiseIdx == legWps.Count - 1;
     return atEnd && dist < WpArriveRadius() && vmag < ARRIVE_SPEED;
@@ -1029,6 +1086,23 @@ double AlignTo(Vector3D targetFwd, Vector3D targetUp, double maxRad)
     Vector3D fErr = rc.WorldMatrix.Forward.Cross(targetFwd);
     Vector3D uErr = rc.WorldMatrix.Up.Cross(targetUp);
     Vector3D err = fErr + uErr;   // combined world-space rotation axis * angle
+    double attErr = fErr.Length() + uErr.Length();
+
+    Vector3D angVel = rc.GetShipVelocities().AngularVelocity;   // world rad/s
+
+    // Rest deadband: once the nose is on heading AND the hull isn't actually rotating,
+    // hold the gyros fully inert rather than feeding AngularVelocity back through the
+    // damping term. The reported angular velocity carries frame-to-frame float noise,
+    // so a gyro that's strong relative to the ship's mass chatters forever chasing
+    // "motion" that isn't real. Capping RPM can't fix this - the twitch lives at the
+    // low end - only stopping the command does. Re-engages the instant a real
+    // disturbance pushes us back outside the band.
+    if (attErr < GYRO_REST_ATT && angVel.Length() < GYRO_REST_RATE)
+    {
+        foreach (var g in gyros)
+            if (g != null && g.IsWorking) { g.GyroOverride = true; g.Pitch = 0f; g.Yaw = 0f; g.Roll = 0f; }
+        return attErr;
+    }
 
     // Inside the deadband, stop chasing the target: drop the P term so the command is
     // pure damping (-angVel*gyroDamp), which nulls any residual spin and then holds
@@ -1036,7 +1110,6 @@ double AlignTo(Vector3D targetFwd, Vector3D targetUp, double maxRad)
     // rests (and keeps re-trimming thrust, burning fuel).
     if (err.Length() < ALIGN_DEADBAND) err = Vector3D.Zero;
 
-    Vector3D angVel = rc.GetShipVelocities().AngularVelocity;   // world rad/s
     Vector3D cmd = err * gyroGain - angVel * gyroDamp;
 
     // Cap the commanded angular rate so rotation stays gentle (rad/s, frame-independent).
@@ -1052,7 +1125,7 @@ double AlignTo(Vector3D targetFwd, Vector3D targetUp, double maxRad)
         g.Yaw   = (float)(-local.Y);
         g.Roll  = (float)(-local.Z);
     }
-    return fErr.Length() + uErr.Length();
+    return attErr;
 }
 
 // Gyro angular-rate cap in rad/s. gyroRpmCap>0 uses that; otherwise PAM's gentle
@@ -1070,6 +1143,12 @@ double GyroCapRad()
 void ApplyForce(Vector3D worldForce)
 {
     if (rc == null) return;
+    // Never write a non-finite override to a thruster. A NaN/Infinity ThrustOverride
+    // propagates straight into the physics solver and can destabilise or crash the
+    // server - it is the one thing this script does that a client can't just shrug off.
+    // If the force ever arrives non-finite (a degenerate path/velocity vector slipping
+    // through upstream), cut thrust this tick rather than feed garbage to the engines.
+    if (!IsFinite(worldForce)) { ZeroThrusters(); return; }
     double[] cap; MatrixD toLocal;
     AxisThrust(out cap, out toLocal);
     Vector3D lf = Vector3D.TransformNormal(worldForce, toLocal);
@@ -1088,6 +1167,15 @@ void ApplyForce(Vector3D worldForce)
         double share = need[k] * (t.MaxEffectiveThrust / cap[k]);
         t.ThrustOverride = (float)Math.Min(share, t.MaxEffectiveThrust);
     }
+}
+
+// True only if every component is a real, finite number. Guards the thrust path
+// against NaN/Infinity (see ApplyForce) - Math.Max(0, NaN) is NaN and NaN <= eps is
+// false, so a bad force would otherwise sail past the per-thruster skip guard.
+static bool IsFinite(Vector3D v)
+{
+    return !double.IsNaN(v.X) && !double.IsNaN(v.Y) && !double.IsNaN(v.Z) &&
+           !double.IsInfinity(v.X) && !double.IsInfinity(v.Y) && !double.IsInfinity(v.Z);
 }
 
 // Sum each working thruster's MaxEffectiveThrust into its ship-local axis bucket

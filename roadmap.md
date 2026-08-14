@@ -4,7 +4,7 @@ Master tracking document for the SkippyShuttle Programmable Block script.
 
 ## Current status
 
-- **Version:** 0.13.1
+- **Version:** 0.13.6
 - **Phase:** 1 (Core shuttle) + LCD UI + orientation-matched docking + per-connector departure
   triggers + per-screen display views (+ per-screen padding) + base-role config hygiene — delivered,
   pending in-world validation
@@ -272,6 +272,47 @@ Delivered into the core (was conditional). Docking is no longer nose-first-only.
       (default 15 m; 0 = off). Fixes the 78 km run overflowing the waypoint cap. *Field-confirm:
       re-record HOME→DEST and check the straight cruise uses only a handful of waypoints while
       the dock approaches keep full detail.*
+- [x] **Progress-based cruise watchdog (v0.13.2)** — collinear simplification made a straight
+      leg a single waypoint tens of km away, which false-tripped the old "60 s without a
+      waypoint advance" stuck-watchdog and faulted the ship mid-cruise (restoring dampeners).
+      The watchdog now resets on *closing distance* to the current waypoint, so a long straight
+      flown correctly never faults while a genuine stall still does. *Field-confirm: a full
+      simplified straight leg completes without a "Cruise stuck" fault.*
+- [x] **Gyro rest deadband (v0.13.3)** — the attitude loop fed noisy `AngularVelocity` back
+      through the damping term every frame, so strong gyros micro-jittered while holding a
+      heading (even at `gyroRpmCap = 2`). Added `GYRO_REST_ATT` / `GYRO_REST_RATE`: on heading
+      and not rotating → gyros held inert, re-engaging only on a real disturbance. *Field-confirm:
+      no gyro chatter while coasting a straight; heading still holds.*
+- [x] **Heading-only cruise throttle (v0.13.3)** — the forward-speed governor throttled on the
+      combined heading+roll attitude error, so crossing into gravity (where "up" flips to
+      anti-gravity, adding a standing roll error until level) capped cruise to ~30 m/s. Now
+      throttles on heading error only. *(Necessary but not sufficient — see v0.13.4.)*
+- [x] **Orthogonal cruise up-target (v0.13.4)** — the real cause of the ~30 m/s gravity cap. The
+      attitude controller held Forward = pathDir *and* Up = −gravity, which are only jointly
+      satisfiable when orthogonal; on a climbing/descending leg the gyro settled on a standing
+      ~45° heading compromise (measured in-world: `aF0.15 hd45`), which the heading throttle
+      floored to 0.15 → ~30 m/s. `upTarget` is now the component of anti-gravity perpendicular to
+      the flight direction (Gram-Schmidt), so the gyro hits the heading exactly and the throttle
+      opens to full. *Field-confirm: full cruise speed on the base→station climb, belly still
+      level.*
+- [x] **Cruise cap anti-chatter (v0.13.5)** — the velocity P-controller reverse-thrust at a hard
+      speed cap (over → brake, under → accelerate at 60 Hz) caused the shaking/throttle pulsing
+      felt while holding cruise. Now coasts through a small along-track overshoot
+      (`CRUISE_COAST_BAND = 5 m/s`) instead of braking it; cross-track correction, gravity hover,
+      and real corner/arrival braking are unaffected. *Field-confirm: steady throttle at the cap,
+      no pulsing.*
+- [x] **Non-finite thrust guard (v0.13.5)** — `ApplyForce` refuses to write a `NaN`/`Infinity`
+      `ThrustOverride` (cuts thrust that tick), closing the one script-side vector that could
+      destabilise/crash a server. Defensive: no known upstream produces one, but the old
+      per-thruster skip guard is `false` for `NaN`.
+- [x] **Cruise vertical-jitter deadband (v0.13.6)** — after the along-track coast fixed the
+      speed-cap pulsing, a vertical up/down shake remained in low gravity. The cruise vertical
+      force is hover (`−grav·mass`) plus a velocity correction; at `g ≈ 0.05` the hover bias is
+      so small that a ~0.25 m/s velocity error flips the net vertical force sign and swaps
+      thruster banks at 60 Hz. Added `VEL_DEADBAND = 0.4 m/s`: sub-threshold velocity error is
+      left uncorrected (hover always kept), so the ship rides through the noise; path position
+      still self-corrects via the target-pointing desired velocity. *Field-confirm: steady
+      vertical hold during high-altitude cruise.*
 - [ ] Multi-stop routes (more than two connectors).
 - [ ] Per-item load manifests (fill specific items to target amounts).
 
