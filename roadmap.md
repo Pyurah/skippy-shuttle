@@ -4,10 +4,10 @@ Master tracking document for the SkippyShuttle Programmable Block script.
 
 ## Current status
 
-- **Version:** 0.14.1
+- **Version:** 0.15.0
 - **Phase:** 1 (Core shuttle) + LCD UI + orientation-matched docking + per-connector departure
-  triggers + per-screen display views (+ per-screen padding) + base-role config hygiene — delivered,
-  pending in-world validation
+  triggers + per-screen display views (+ per-screen padding) + base-role config hygiene +
+  dock-clearance anti-collision — delivered, pending in-world validation
 - **Environment:** Space Engineers in-game Programmable Block (single-file C#, no external
   build/test tooling available)
 
@@ -332,6 +332,20 @@ Delivered into the core (was conditional). Docking is no longer nose-first-only.
       gyros fought the translation controller (jitter); cruise now latches a heading-hold that
       ignores angular-velocity noise and wakes only on real heading drift. Docking keeps the strict
       rest. *Field-confirm awaited: snappy undock turn, steady gyros at cruise in space.*
+- [x] **Dock-clearance / anti-collision (v0.15.0)** — a shuttle was destroyed when another ship
+      landed on its connector mid-dock. Final approach now raycasts the docking corridor with an
+      onboard camera and **holds off at the on-axis stand-off** if a foreign grid is parked on or
+      crossing the connector, auto-resuming (after a ~1.5 s clear-confirm debounce) once the path
+      is clear. Detection is camera-primary and **identity-based**: `RECORD` now also captures each
+      dock's base grid id (`homeBaseId`/`destBaseId`), so the ray tells the base itself from an
+      intruder — the base's own connector and off-axis neighbours never false-positive; only a grid
+      actually in the approach path holds the shuttle. Keys: `dockClearCheck` (default on),
+      `cameraTag` (`[SHUTTLE:CAM]`, or auto-pick any camera facing the dock), `dockBlockSec`
+      (default `0` = wait forever, so a false positive costs only time). Pre-0.15 routes fall back
+      to a conservative distance rule; re-record for identity checks. *Field-confirm awaited: holds
+      for a blocker, resumes when clear, doesn't false-block on the base's own connector.*
+      **Secondary layer deferred:** a base PB broadcasting connector-occupancy over IGC as a
+      cross-check when no camera can see the corridor (a fast-follow).
 - [ ] Multi-stop routes (more than two connectors).
 - [ ] Per-item load manifests (fill specific items to target amounts).
 

@@ -1,4 +1,4 @@
-const string VERSION = "0.14.1";
+const string VERSION = "0.15.0";
 enum Role { Shuttle, Base }
 enum RunMode { Continuous, OneTrip, OneWay }
 enum DepartTrigger { Auto, Cargo, Timer, Manual }
@@ -8,6 +8,7 @@ struct DockPose
     public Vector3D Fwd;
     public Vector3D Up;
     public Vector3D ConnFwd;
+    public long BaseGridId;
 }
 enum State
 {
@@ -52,6 +53,9 @@ double cornerLen = 30;
 double gyroGain = 4.0;
 double gyroDamp = 3.0;
 string cruiseAttitude = "auto";
+bool dockClearCheck = true;
+string cameraTag = "[SHUTTLE:CAM]";
+double dockBlockSec = 0;
 DockPose homePose, destPose;
 string homeConn = "", destConn = "";
 List<Vector3D> path = new List<Vector3D>();
@@ -73,6 +77,8 @@ double cruiseProgTimer = 0;
 double cruiseBestDist = double.MaxValue;
 bool cruiseFlyLevel = false;
 bool gyroResting = false;
+double dockBlockTimer = 0;
+double dockClearFor = 0;
 const string VIEW_FULL = "full", VIEW_MENU = "menu", VIEW_STATUS = "status", VIEW_TRIP = "trip";
 const int PAGE_MAIN = 0, PAGE_RECORD = 1, PAGE_SETTINGS = 2, PAGE_DEPART = 3;
 int menuPage = PAGE_MAIN;
@@ -93,6 +99,7 @@ List<IMyGyro> gyros = new List<IMyGyro>();
 List<IMyThrust> thrusters = new List<IMyThrust>();
 List<IMyGasTank> h2Tanks = new List<IMyGasTank>();
 List<IMyBatteryBlock> batteries = new List<IMyBatteryBlock>();
+List<IMyCameraBlock> cameras = new List<IMyCameraBlock>();
 IMyBroadcastListener listener;
 Dictionary<string, ShuttleReport> fleet = new Dictionary<string, ShuttleReport>();
 const double DT_FALLBACK = 1.0 / 6.0;
@@ -121,6 +128,10 @@ const double COAST_HOLD_WAKE = 0.10;
 const double COAST_TOL = 0.5;
 const double CRUISE_COAST_BAND = 5.0;
 const double VEL_DEADBAND = 0.4;
+const double CLEAR_CONE_DOT = 0.70;
+const double CLEAR_CONFIRM_SEC = 1.5;
+const double CLEAR_RANGE_PAD = 5.0;
+const double CLEAR_LEGACY_MARGIN = 5.0;
 Program()
 {
     Runtime.UpdateFrequency = UpdateFrequency.Update10;
@@ -350,7 +361,9 @@ DockPose CapturePose(IMyShipConnector c)
         Pos     = rc.GetPosition(),
         Fwd     = rc.WorldMatrix.Forward,
         Up      = rc.WorldMatrix.Up,
-        ConnFwd = c.WorldMatrix.Forward
+        ConnFwd = c.WorldMatrix.Forward,
+        BaseGridId = (c.Status == MyShipConnectorStatus.Connected && c.OtherConnector != null)
+                     ? c.OtherConnector.CubeGrid.EntityId : 0
     };
 }
 void TickRecording()
@@ -547,6 +560,7 @@ void ArmCruise(bool toDest)
     cruiseIdx = 0;
     cruiseProgTimer = 0;
     cruiseBestDist = double.MaxValue;
+    dockBlockTimer = 0; dockClearFor = 0;
     cruiseArmed = true;
     cruiseArmedToDest = toDest;
     statusMsg = toDest ? "Cruising to destination" : "Cruising home";
@@ -704,6 +718,35 @@ void TickApproach(bool toDest)
     if (c != null && c.Status == MyShipConnectorStatus.Connectable)
         c.Connect();
     if (rc.IsAutoPilotEnabled) AbortAutopilot();
+    if (DockCorridorBlocked(p))
+    {
+        dockClearFor = 0;
+        dockBlockTimer += dt;
+        FlyToPose(ApproachPoint(p), p.Fwd, p.Up, 0.3);
+        phaseTimer = 0;
+        statusMsg = (toDest ? "Dock blocked at destination" : "Dock blocked at home")
+                  + " - holding (" + dockBlockTimer.ToString("0") + "s)";
+        if (dockBlockSec > 0 && dockBlockTimer >= dockBlockSec)
+        {
+            AbortAutopilot();
+            ReleaseControl();
+            state = State.Faulted;
+            statusMsg = "Dock blocked - gave up after " + dockBlockSec.ToString("0") + "s";
+        }
+        return;
+    }
+    if (dockBlockTimer > 0)
+    {
+        dockClearFor += dt;
+        if (dockClearFor < CLEAR_CONFIRM_SEC)
+        {
+            FlyToPose(ApproachPoint(p), p.Fwd, p.Up, 0.3);
+            phaseTimer = 0;
+            statusMsg = (toDest ? "Dock clearing at destination" : "Dock clearing at home") + " - confirming";
+            return;
+        }
+        dockBlockTimer = 0;
+    }
     FlyToPose(p.Pos, p.Fwd, p.Up, 0.3);
     phaseTimer += dt;
     statusMsg = (toDest ? "Docking at destination" : "Docking at home")
@@ -849,6 +892,8 @@ void ReleaseControl()
     foreach (var t in thrusters) if (t != null) t.ThrustOverride = 0f;
     foreach (var g in gyros)
         if (g != null) { g.GyroOverride = false; g.Pitch = 0f; g.Yaw = 0f; g.Roll = 0f; }
+    foreach (var cam in cameras) if (cam != null) cam.EnableRaycast = false;
+    dockBlockTimer = 0; dockClearFor = 0;
     SetDampeners(true);
 }
 void ZeroThrusters()
@@ -886,6 +931,35 @@ void OnDocked(bool atDest)
         else { state = State.Loading; phaseTimer = 0; }
     }
 }
+bool DockCorridorBlocked(DockPose p)
+{
+    if (!dockClearCheck || cameras.Count == 0 || rc == null) return false;
+    Vector3D dock = p.Pos;
+    IMyCameraBlock best = null;
+    double bestDot = CLEAR_CONE_DOT, dockDist = 0;
+    foreach (var cam in cameras)
+    {
+        if (cam == null || !cam.IsWorking) continue;
+        Vector3D toDock = dock - cam.GetPosition();
+        double d = toDock.Length();
+        if (d < 1e-3) continue;
+        double dot = cam.WorldMatrix.Forward.Dot(toDock / d);
+        if (dot > bestDot) { bestDot = dot; best = cam; dockDist = d; }
+    }
+    if (best == null) return false;
+    if (!best.EnableRaycast) best.EnableRaycast = true;
+    if (!best.CanScan(dockDist + CLEAR_RANGE_PAD)) return false;
+    MyDetectedEntityInfo hit = best.Raycast(dock);
+    if (hit.IsEmpty()) return false;
+    if (hit.EntityId == p.BaseGridId) return false;
+    if (hit.EntityId == Me.CubeGrid.EntityId) return false;
+    if (p.BaseGridId == 0)
+    {
+        double hitDist = Vector3D.Distance(best.GetPosition(), hit.HitPosition ?? dock);
+        return hitDist < dockDist - CLEAR_LEGACY_MARGIN;
+    }
+    return true;
+}
 void Discover()
 {
     connectors.Clear(); cargo.Clear(); shipScreens.Clear();
@@ -903,6 +977,11 @@ void Discover()
     GridTerminalSystem.GetBlocksOfType(gyros, b => b.CubeGrid == grid);
     GridTerminalSystem.GetBlocksOfType(thrusters, b => b.CubeGrid == grid);
     GridTerminalSystem.GetBlocksOfType(batteries, b => b.CubeGrid == grid);
+    var cams = new List<IMyCameraBlock>();
+    GridTerminalSystem.GetBlocksOfType(cams, b => b.CubeGrid == grid);
+    cameras.Clear();
+    foreach (var cam in cams) if (HasTag(cam.CustomName, cameraTag)) cameras.Add(cam);
+    if (cameras.Count == 0) cameras.AddRange(cams);
     var tanks = new List<IMyGasTank>();
     GridTerminalSystem.GetBlocksOfType(tanks, b => b.CubeGrid == grid);
     h2Tanks.Clear();
@@ -1643,6 +1722,9 @@ void WriteShuttleSection(MyIni ini)
     ini.Set("shuttle", "gyroGain", gyroGain);
     ini.Set("shuttle", "gyroDamp", gyroDamp);
     ini.Set("shuttle", "cruiseAttitude", cruiseAttitude);
+    ini.Set("shuttle", "dockClearCheck", dockClearCheck);
+    ini.Set("shuttle", "cameraTag", cameraTag);
+    ini.Set("shuttle", "dockBlockSec", dockBlockSec);
 }
 void LoadConfig()
 {
@@ -1682,6 +1764,9 @@ void LoadConfig()
     gyroDamp = Math.Max(0.0, ini.Get("shuttle", "gyroDamp").ToDouble(gyroDamp));
     string attStr = ini.Get("shuttle", "cruiseAttitude").ToString(cruiseAttitude).Trim().ToLowerInvariant();
     cruiseAttitude = (attStr == "level" || attStr == "nose") ? attStr : "auto";
+    dockClearCheck = ini.Get("shuttle", "dockClearCheck").ToBoolean(dockClearCheck);
+    cameraTag = ini.Get("shuttle", "cameraTag").ToString(cameraTag);
+    dockBlockSec = Math.Max(0, ini.Get("shuttle", "dockBlockSec").ToDouble(dockBlockSec));
 }
 void SetModeSilent(string m)
 {
@@ -1716,6 +1801,8 @@ void SaveRoute()
     ini.Set("route", "destFwd", Vec(destPose.Fwd));
     ini.Set("route", "destUp", Vec(destPose.Up));
     ini.Set("route", "destConnFwd", Vec(destPose.ConnFwd));
+    ini.Set("route", "homeBaseId", homePose.BaseGridId);
+    ini.Set("route", "destBaseId", destPose.BaseGridId);
     var sb = new StringBuilder();
     for (int i = 0; i < path.Count; i++) { if (i > 0) sb.Append(';'); sb.Append(Vec(path[i])); }
     ini.Set("route", "path", sb.ToString());
@@ -1736,6 +1823,8 @@ void LoadRoute()
                  & TryVec(ini.Get("route", "destFwd").ToString(""), out destPose.Fwd)
                  & TryVec(ini.Get("route", "destUp").ToString(""), out destPose.Up)
                  & TryVec(ini.Get("route", "destConnFwd").ToString(""), out destPose.ConnFwd);
+    homePose.BaseGridId = ini.Get("route", "homeBaseId").ToInt64(0);
+    destPose.BaseGridId = ini.Get("route", "destBaseId").ToInt64(0);
     path.Clear();
     var raw = ini.Get("route", "path").ToString("");
     if (!string.IsNullOrEmpty(raw))

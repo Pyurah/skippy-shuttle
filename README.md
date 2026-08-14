@@ -73,6 +73,9 @@ two docking points (for example, a planet base and an orbital station).
 | `gyroGain` | `4` | Attitude P gain — how hard the gyros rotate toward the target heading. Higher = snappier turns |
 | `gyroDamp` | `3` | Attitude damping. Raise it if a hull still wobbles/overshoots/jiggles onto heading; lower toward `2` for snappier turns |
 | `cruiseAttitude` | `auto` | Attitude while flying **in gravity**. `auto` = fly level (belly-down VTOL climb) if the hull is lift-heavy, else nose-to-path; `level` = force VTOL climb (strong down-thrusters lift); `nose` = force nose-along-path. In space it always flies nose-forward regardless |
+| `dockClearCheck` | `true` | Anti-collision: raycast the docking corridor on final approach and **hold off** if another grid is parked on / crossing the connector, resuming when clear. Set `false` to disable |
+| `cameraTag` | `[SHUTTLE:CAM]` | Cameras that watch the dock (name **contains** the tag). If none are tagged, every camera on the grid is used and the one actually facing the dock is picked automatically |
+| `dockBlockSec` | `0` | Seconds a blocked corridor is tolerated before the shuttle **faults**. `0` = wait indefinitely — so a false positive only ever costs time, never a fault |
 
 The recorded route lives in a separate `[route]` section that the script writes for you.
 **To clone a route to another identical ship, copy that whole `[route]` section into its PB.**
@@ -258,6 +261,18 @@ range of each other (see the range note above).
   mate. If it fails to seat, the approach times out after 45 s and the shuttle **faults**
   rather than grinding on the dock — widen `approachDist`, lower `dockSpeed`, or check that
   the recorded connector axis is clear of obstacles.
+- **Dock-clearance is camera-based and identity-aware.** On final approach the shuttle raycasts
+  the corridor to the dock and holds off if a *foreign* grid is in the way, auto-resuming when
+  clear. It knows the base from an intruder because `RECORD HOME`/`RECORD DEST` capture the base's
+  grid id — so the base's own connector and off-axis neighbours never false-trigger; only a ship
+  genuinely in the approach path holds it. It needs **a camera that can see the dock**: mount one
+  facing the connector's approach axis (tag it `cameraTag`, default `[SHUTTLE:CAM]`, or leave all
+  cameras untagged and the shuttle picks whichever faces the dock). With no camera that can see the
+  corridor it degrades gracefully — it simply docks as before (no false holds). A blocked corridor
+  **waits forever by default** (`dockBlockSec = 0`); set `dockBlockSec` to fault after N seconds if
+  you'd rather it give up. **Re-record routes taught before v0.15.0** to store the base grid id —
+  older routes fall back to a coarser distance rule. Disable the whole check with
+  `dockClearCheck = false`.
 - Control gains are tuned conservatively but every ship is different. The attitude gains
   `gyroGain` (turn snappiness) and `gyroDamp` (wobble damping) are **live-tunable in Custom
   Data**. The flight controller now runs at 60 Hz while flying, so the heading holds steady and

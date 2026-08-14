@@ -4,6 +4,38 @@ All notable changes to SkippyShuttle are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.15.0] - 2026-08-13
+
+### Added
+- **Dock-clearance / anti-collision on final approach.** A shuttle was destroyed when another
+  ship landed on its connector while it was docking. The shuttle now raycasts the docking
+  corridor with an onboard camera and **holds off at the on-axis stand-off** if another grid is
+  parked on — or drifting across — the connector, then resumes automatically once the corridor is
+  clear. Detection is camera-primary and **identity-based**: `RECORD HOME`/`RECORD DEST` now also
+  capture the base's grid id (from the docked connector's mate), so the approach ray can tell *the
+  base itself* from *someone else's ship*. The ray to the dock point reads the first thing in the
+  way:
+    - hits nothing → clear;
+    - hits the base's own grid → clear (identity match, distance-agnostic);
+    - hits any **other** grid in the corridor → **blocked**.
+  That identity match is why the cases that would otherwise false-positive don't: the base's own
+  connector reads clear (it *is* the base), an off-axis neighbour the ray never touches reads
+  clear, and a ship that undocked but lingers *beside* the corridor is never hit. Only a foreign
+  grid genuinely in the approach path holds the shuttle off — and there, waiting is exactly right,
+  because flying into it is the crash being prevented. A crossing ship must clear for ~1.5 s
+  before the approach resumes (debounce), so the shuttle never lurches forward into a ship still
+  moving through.
+- **New Custom Data keys** (all optional, safe defaults):
+    - `dockClearCheck` (default `true`) — enable/disable the clearance check.
+    - `cameraTag` (default `[SHUTTLE:CAM]`) — cameras that watch the dock; if none carry the tag,
+      every camera on the grid is used and the one actually facing the dock is picked at check time.
+    - `dockBlockSec` (default `0`) — seconds a blocked corridor is tolerated before faulting.
+      `0` = wait indefinitely, so a false positive only ever costs time, never a fault.
+- **Routes now store each dock's base grid id** (`homeBaseId` / `destBaseId` in the `[route]`
+  section) for the identity check. Pre-0.15 routes have no id and fall back to a conservative
+  distance rule (block only a hit clearly in front of where the base should be); **re-record a
+  route** to enable the exact identity check.
+
 ## [0.14.1] - 2026-08-13
 
 ### Fixed

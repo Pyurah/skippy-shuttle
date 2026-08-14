@@ -37,12 +37,14 @@
  * coasts thrust-free in space (restored on stop/dock/fault/recompile). In gravity it
  * flies level (belly-down VTOL climb) when the hull is lift-heavy so the strong down-
  * thrusters do the climbing, else nose-to-path; forced with cruiseAttitude in Custom
- * Data (auto|level|nose). Sorters are
+ * Data (auto|level|nose). On final approach it raycasts the docking corridor with a
+ * camera and HOLDS off if another grid is parked on / crossing the connector (anti-
+ * collision), auto-resuming when clear; see DockCorridorBlocked. Sorters are
  * only toggled on/off (filters/Drain-All untouched); tag match is case-insensitive
  * anywhere in the name. Version tracked in CHANGELOG.md. Semver.
  *//////////////////////////////////////////////////////////////////////////////
 
-const string VERSION = "0.14.1";
+const string VERSION = "0.15.0";
 
 // ---- Roles / states --------------------------------------------------------
 enum Role { Shuttle, Base }
@@ -75,6 +77,7 @@ struct DockPose
     public Vector3D Fwd;      // Remote Control world forward while docked
     public Vector3D Up;       // Remote Control world up while docked
     public Vector3D ConnFwd;  // bound connector's world forward (points into the dock)
+    public long BaseGridId;   // EntityId of the static grid this dock belongs to; lets the clearance raycast tell the base from a foreign ship parked on the connector (0 = unknown / pre-0.15 route)
 }
 enum State
 {
@@ -121,6 +124,9 @@ double cornerLen = 30;            // [m] corner-rounding length; also the look-a
 double gyroGain = 4.0;            // attitude controller P gain (rotate toward the target attitude)
 double gyroDamp = 3.0;            // attitude controller damping on angular velocity; raise if the ship wobbles/overshoots/jiggles
 string cruiseAttitude = "auto";   // gravity-leg attitude: "auto" (level if lift-heavy, else nose), "level" (VTOL climb, belly down), "nose" (nose along path)
+bool dockClearCheck = true;       // anti-collision: raycast the docking corridor on final approach and hold off if another grid is parked on / crossing the connector
+string cameraTag = "[SHUTTLE:CAM]"; // cameras that watch the dock; blank / no match = auto-use every camera and pick whichever faces the dock at check time
+double dockBlockSec = 0;          // [s] fault if the corridor stays blocked this long. 0 = wait indefinitely (a blocked dock holds forever, never faults)
 
 // ---- Route data ------------------------------------------------------------
 // A route is two docked poses (home + dest) plus the breadcrumb path between
@@ -160,6 +166,8 @@ double cruiseProgTimer = 0;                     // seconds since the ship last c
 double cruiseBestDist = double.MaxValue;        // closest approach so far to the current waypoint; getting nearer resets the watchdog. A simplified straight is one waypoint tens of km away, so timing waypoint *arrivals* false-faults on a leg the ship is flying perfectly (v0.13.2)
 bool cruiseFlyLevel = false;                    // latched decision (with hysteresis) for auto cruiseAttitude: true = fly belly-down/VTOL, false = nose-to-path. See UseLevelFlight
 bool gyroResting = false;                        // latch: gyros held inert on-heading during coast-hold (see AlignTo). Wakes only on real heading drift, not angular-velocity noise from thruster torque - stops the gyros fighting the translation controller at cruise
+double dockBlockTimer = 0;                        // s the docking corridor has read continuously blocked (see TickApproach); drives the optional dockBlockSec give-up and the status readout
+double dockClearFor = 0;                          // s the corridor has read clear since a block; must exceed CLEAR_CONFIRM_SEC before a held approach resumes, so we don't lurch forward at a ship still crossing
 
 // ---- Display views (ship role) ---------------------------------------------
 // Each ship screen shows ONE view, so a 3-screen cockpit can split the display
@@ -198,6 +206,7 @@ List<IMyGyro> gyros = new List<IMyGyro>();          // final-approach attitude c
 List<IMyThrust> thrusters = new List<IMyThrust>();  // final-approach translation control
 List<IMyGasTank> h2Tanks = new List<IMyGasTank>();  // hydrogen tanks (fuel-gate reading)
 List<IMyBatteryBlock> batteries = new List<IMyBatteryBlock>();  // batteries (charge-gate reading)
+List<IMyCameraBlock> cameras = new List<IMyCameraBlock>();      // dock-clearance raycast (anti-collision on final approach)
 IMyBroadcastListener listener;
 
 // ---- Base-role state -------------------------------------------------------
@@ -233,6 +242,12 @@ const double COAST_HOLD_WAKE = 0.10;      // rad (~5.7 deg): only a heading drif
 const double COAST_TOL = 0.5;             // m/s velocity error below which the ship coasts (thrust off) in space
 const double CRUISE_COAST_BAND = 5.0;     // m/s along-track overshoot tolerated without reverse-thrust (kills speed-cap pulsing)
 const double VEL_DEADBAND = 0.4;          // m/s: velocity-tracking error below this is not corrected (hover kept) - kills the vertical/cross-track thrust chatter, worst in low gravity
+
+// ---- Dock-clearance (anti-collision) tuning --------------------------------
+const double CLEAR_CONE_DOT = 0.70;       // cos(~45 deg): a camera must face this close to the dock direction for its raycast to be trusted (an out-of-cone ray silently reads empty, i.e. falsely "clear")
+const double CLEAR_CONFIRM_SEC = 1.5;     // s the corridor must read clear before a held approach resumes - debounces a ship briefly crossing the corridor so we don't lurch into its path
+const double CLEAR_RANGE_PAD = 5.0;       // m added to the dock distance when checking the camera has charged enough scan range to reach past the mating plane
+const double CLEAR_LEGACY_MARGIN = 5.0;   // m: pre-0.15 routes store no base grid id, so identity can't be checked - treat only a hit this much closer than the dock point as an obstruction (stay conservative; re-record to enable identity checks)
 
 // ============================================================================
 //  Lifecycle
@@ -528,7 +543,12 @@ DockPose CapturePose(IMyShipConnector c)
         Pos     = rc.GetPosition(),
         Fwd     = rc.WorldMatrix.Forward,
         Up      = rc.WorldMatrix.Up,
-        ConnFwd = c.WorldMatrix.Forward   // points out of the connector face, into the dock
+        ConnFwd = c.WorldMatrix.Forward,   // points out of the connector face, into the dock
+        // Docked while recording, so OtherConnector is the base's mating connector - its
+        // grid is the static dock. Stored so the approach raycast can tell "the base
+        // itself" from "someone else's ship parked on my connector".
+        BaseGridId = (c.Status == MyShipConnectorStatus.Connected && c.OtherConnector != null)
+                     ? c.OtherConnector.CubeGrid.EntityId : 0
     };
 }
 
@@ -788,6 +808,7 @@ void ArmCruise(bool toDest)
     cruiseIdx = 0;
     cruiseProgTimer = 0;
     cruiseBestDist = double.MaxValue;
+    dockBlockTimer = 0; dockClearFor = 0;   // fresh leg: clear any stale dock-clearance hold state
     cruiseArmed = true;
     cruiseArmedToDest = toDest;
     statusMsg = toDest ? "Cruising to destination" : "Cruising home";
@@ -1045,6 +1066,41 @@ void TickApproach(bool toDest)
 
     if (rc.IsAutoPilotEnabled) AbortAutopilot();
 
+    // Anti-collision: if another grid is parked in (or crossing) the docking corridor,
+    // loiter at the on-axis stand-off instead of flying into it. A false positive only
+    // costs time (we hold and auto-resume) - it never faults unless dockBlockSec is set.
+    if (DockCorridorBlocked(p))
+    {
+        dockClearFor = 0;
+        dockBlockTimer += dt;
+        FlyToPose(ApproachPoint(p), p.Fwd, p.Up, 0.3);   // hold clear of the dock, on-axis
+        phaseTimer = 0;                                   // don't let the docking timeout fire while we're legitimately waiting
+        statusMsg = (toDest ? "Dock blocked at destination" : "Dock blocked at home")
+                  + " - holding (" + dockBlockTimer.ToString("0") + "s)";
+        if (dockBlockSec > 0 && dockBlockTimer >= dockBlockSec)
+        {
+            AbortAutopilot();
+            ReleaseControl();
+            state = State.Faulted;
+            statusMsg = "Dock blocked - gave up after " + dockBlockSec.ToString("0") + "s";
+        }
+        return;
+    }
+    // Corridor reads clear. After a block, require CLEAR_CONFIRM_SEC of continuous clear
+    // before resuming, so a ship still crossing doesn't get us moving into its path.
+    if (dockBlockTimer > 0)
+    {
+        dockClearFor += dt;
+        if (dockClearFor < CLEAR_CONFIRM_SEC)
+        {
+            FlyToPose(ApproachPoint(p), p.Fwd, p.Up, 0.3);   // keep loitering through the confirm window
+            phaseTimer = 0;
+            statusMsg = (toDest ? "Dock clearing at destination" : "Dock clearing at home") + " - confirming";
+            return;
+        }
+        dockBlockTimer = 0;   // confirmed clear; fall through and resume the approach
+    }
+
     // Orientation-matched final approach: hold the recorded attitude while
     // translating straight down the connector axis into the dock.
     FlyToPose(p.Pos, p.Fwd, p.Up, 0.3);
@@ -1290,6 +1346,8 @@ void ReleaseControl()
     foreach (var t in thrusters) if (t != null) t.ThrustOverride = 0f;
     foreach (var g in gyros)
         if (g != null) { g.GyroOverride = false; g.Pitch = 0f; g.Yaw = 0f; g.Roll = 0f; }
+    foreach (var cam in cameras) if (cam != null) cam.EnableRaycast = false;   // stop charging the dock-clearance raycast
+    dockBlockTimer = 0; dockClearFor = 0;
     SetDampeners(true);
 }
 
@@ -1340,6 +1398,65 @@ void OnDocked(bool atDest)
 }
 
 // ============================================================================
+//  Dock clearance (anti-collision on final approach)
+// ============================================================================
+// Raycast down the docking corridor to catch another grid parked on - or drifting
+// across - the connector before we fly into it (a shuttle was destroyed doing exactly
+// this when someone landed on its dock). Camera-primary: pick the camera that actually
+// faces the dock, cast a thin ray to the docked-pose point, and read the first thing
+// between us and the dock:
+//   - hit nothing (open segment) ........... clear
+//   - hit the base's own grid .............. clear   (identity match, distance-agnostic)
+//   - hit any OTHER grid in the corridor ... BLOCKED
+// The identity match is why this doesn't false-positive on the cases the operator worried
+// about: the base's own connector reads clear (it IS the base), an off-axis neighbour the
+// ray never touches reads clear, and a ship that undocked but lingers *beside* the corridor
+// is never hit. Only a foreign grid genuinely in the approach path holds us off - and there
+// waiting is exactly right, because flying into it is the crash we're preventing.
+// Pre-0.15 routes stored no base grid id; those fall back to a conservative distance rule.
+// Returns true = corridor blocked.
+bool DockCorridorBlocked(DockPose p)
+{
+    if (!dockClearCheck || cameras.Count == 0 || rc == null) return false;
+
+    Vector3D dock = p.Pos;
+    // Choose the working camera that faces the dock within the trusted cone and is nearest
+    // on-axis. An out-of-cone raycast silently returns empty (looks "clear"), so a camera
+    // that isn't actually pointed at the dock must never be trusted to clear the corridor.
+    IMyCameraBlock best = null;
+    double bestDot = CLEAR_CONE_DOT, dockDist = 0;
+    foreach (var cam in cameras)
+    {
+        if (cam == null || !cam.IsWorking) continue;
+        Vector3D toDock = dock - cam.GetPosition();
+        double d = toDock.Length();
+        if (d < 1e-3) continue;
+        double dot = cam.WorldMatrix.Forward.Dot(toDock / d);
+        if (dot > bestDot) { bestDot = dot; best = cam; dockDist = d; }
+    }
+    if (best == null) return false;   // no camera can see the corridor -> can't judge; never false-block
+
+    if (!best.EnableRaycast) best.EnableRaycast = true;
+    if (!best.CanScan(dockDist + CLEAR_RANGE_PAD)) return false;   // still charging scan range; treat as clear until it can reach the dock
+
+    MyDetectedEntityInfo hit = best.Raycast(dock);
+    if (hit.IsEmpty()) return false;                          // open corridor
+    if (hit.EntityId == p.BaseGridId) return false;           // the base itself
+    if (hit.EntityId == Me.CubeGrid.EntityId) return false;   // our own hull occluding this camera - ignore it
+
+    if (p.BaseGridId == 0)
+    {
+        // Legacy route: no base identity to compare against. Only treat a hit clearly IN
+        // FRONT of the dock point as an obstruction; a hit at ~dock distance is assumed to
+        // be the base structure. Re-record the route to capture the base id and get the
+        // exact identity check above.
+        double hitDist = Vector3D.Distance(best.GetPosition(), hit.HitPosition ?? dock);
+        return hitDist < dockDist - CLEAR_LEGACY_MARGIN;
+    }
+    return true;   // a foreign grid is sitting in the docking corridor
+}
+
+// ============================================================================
 //  Helpers - blocks & sensors
 // ============================================================================
 void Discover()
@@ -1362,6 +1479,16 @@ void Discover()
     GridTerminalSystem.GetBlocksOfType(gyros, b => b.CubeGrid == grid);
     GridTerminalSystem.GetBlocksOfType(thrusters, b => b.CubeGrid == grid);
     GridTerminalSystem.GetBlocksOfType(batteries, b => b.CubeGrid == grid);
+
+    // Dock-clearance cameras (anti-collision). Prefer cameras tagged cameraTag; if none
+    // carry the tag, fall back to every camera on the grid and let the clearance check
+    // pick whichever one actually faces the dock. Raycast is charged only during an
+    // approach (see DockCorridorBlocked) and powered back down in ReleaseControl.
+    var cams = new List<IMyCameraBlock>();
+    GridTerminalSystem.GetBlocksOfType(cams, b => b.CubeGrid == grid);
+    cameras.Clear();
+    foreach (var cam in cams) if (HasTag(cam.CustomName, cameraTag)) cameras.Add(cam);
+    if (cameras.Count == 0) cameras.AddRange(cams);   // untagged fallback: keep all, filter by aim at check time
 
     // Gas tanks whose subtype names them a Hydrogen tank feed the fuel gate; oxygen
     // tanks are ignored. Ships with no hydrogen tanks just skip the hydrogen check.
@@ -2293,6 +2420,9 @@ void WriteShuttleSection(MyIni ini)
     ini.Set("shuttle", "gyroGain", gyroGain);
     ini.Set("shuttle", "gyroDamp", gyroDamp);
     ini.Set("shuttle", "cruiseAttitude", cruiseAttitude);
+    ini.Set("shuttle", "dockClearCheck", dockClearCheck);
+    ini.Set("shuttle", "cameraTag", cameraTag);
+    ini.Set("shuttle", "dockBlockSec", dockBlockSec);
 }
 
 void LoadConfig()
@@ -2340,6 +2470,9 @@ void LoadConfig()
     // Gravity-leg attitude: only auto/level/nose are meaningful; anything else falls back to auto.
     string attStr = ini.Get("shuttle", "cruiseAttitude").ToString(cruiseAttitude).Trim().ToLowerInvariant();
     cruiseAttitude = (attStr == "level" || attStr == "nose") ? attStr : "auto";
+    dockClearCheck = ini.Get("shuttle", "dockClearCheck").ToBoolean(dockClearCheck);
+    cameraTag = ini.Get("shuttle", "cameraTag").ToString(cameraTag);
+    dockBlockSec = Math.Max(0, ini.Get("shuttle", "dockBlockSec").ToDouble(dockBlockSec));
 }
 
 void SetModeSilent(string m)
@@ -2379,6 +2512,9 @@ void SaveRoute()
     ini.Set("route", "destFwd", Vec(destPose.Fwd));
     ini.Set("route", "destUp", Vec(destPose.Up));
     ini.Set("route", "destConnFwd", Vec(destPose.ConnFwd));
+    // Static grid each dock belongs to, for the approach clearance raycast (0 = unknown).
+    ini.Set("route", "homeBaseId", homePose.BaseGridId);
+    ini.Set("route", "destBaseId", destPose.BaseGridId);
     var sb = new StringBuilder();
     for (int i = 0; i < path.Count; i++) { if (i > 0) sb.Append(';'); sb.Append(Vec(path[i])); }
     ini.Set("route", "path", sb.ToString());
@@ -2405,6 +2541,10 @@ void LoadRoute()
                  & TryVec(ini.Get("route", "destFwd").ToString(""), out destPose.Fwd)
                  & TryVec(ini.Get("route", "destUp").ToString(""), out destPose.Up)
                  & TryVec(ini.Get("route", "destConnFwd").ToString(""), out destPose.ConnFwd);
+
+    // Base grid ids for the clearance raycast; absent (0) on pre-0.15 routes -> distance fallback.
+    homePose.BaseGridId = ini.Get("route", "homeBaseId").ToInt64(0);
+    destPose.BaseGridId = ini.Get("route", "destBaseId").ToInt64(0);
 
     path.Clear();
     var raw = ini.Get("route", "path").ToString("");
